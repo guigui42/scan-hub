@@ -6,34 +6,34 @@
 {{define "saved"}}<span class="saved-tick">Saved</span>{{end}}
 
 {{define "status"}}
-{{if .HasScanSnap}}
-<article class="card" data-tone="{{ssTone .ScanSnap.State}}">
+{{$paperless := .HasPaperless}}
+{{range .Scanners}}
+<article class="card" data-tone="{{.Status.Tone}}" data-scanner="{{.ID}}">
   <header class="card-head">
-    <span class="kicker">Feeder</span>
-    <h3>ScanSnap <em>iX500</em></h3>
+    <span class="kicker">{{kindLabel .Kind}}</span>
+    <h3>{{nameHead .Name}}{{with nameTail .Name}} <em>{{.}}</em>{{end}}</h3>
   </header>
-  <p class="stamp stamp-{{ssTone .ScanSnap.State}}">{{ssLabel .ScanSnap.State}}</p>
+  <p class="stamp stamp-{{.Status.Tone}}">{{.Status.Label}}</p>
   <dl class="facts">
-    <div><dt>Paper</dt><dd>{{if .ScanSnap.Paper}}Loaded{{else}}Empty{{end}}</dd></div>
-    <div><dt>Wi-Fi</dt><dd><span class="bars bars-{{.ScanSnap.WifiSignal}}" aria-label="signal {{.ScanSnap.WifiSignal}} of 3"><i></i><i></i><i></i></span></dd></div>
-    {{with .ScanSnap.Holder}}<div><dt>Held by</dt><dd>{{.}}</dd></div>{{end}}
-    {{with .ScanSnap.Firmware}}<div><dt>Firmware</dt><dd>{{.}}</dd></div>{{end}}
+    {{range .Status.Facts}}
+    <div><dt>{{.Label}}</dt><dd>{{if .Signal}}<span class="bars bars-{{bars .Level}}" aria-label="signal {{bars .Level}} of 3"><i></i><i></i><i></i></span>{{else}}{{.Value}}{{end}}</dd></div>
+    {{end}}
   </dl>
-  {{with .ScanSnap.Detail}}<p class="card-note">{{.}}</p>{{end}}
-  <p class="card-hint">Press <kbd>Scan</kbd> on the scanner to {{if .HasPaperless}}file straight into Paperless{{else}}drop a batch on the desk{{end}}.</p>
-</article>
-{{end}}
-{{if .HasEpson}}
-<article class="card" data-tone="{{epTone .Epson.State}}">
-  <header class="card-head">
-    <span class="kicker">Glass</span>
-    <h3>Epson <em>ET-2750</em></h3>
-  </header>
-  <p class="stamp stamp-{{epTone .Epson.State}}">{{epLabel .Epson.State}}</p>
-  <dl class="facts">
-    <div><dt>Input</dt><dd>Flatbed, one page per pass</dd></div>
-  </dl>
-  {{with .Epson.Detail}}<p class="card-note">{{.}}</p>{{end}}
+  {{with .Status.Detail}}<p class="card-note">{{.}}</p>{{end}}
+  {{if .Released}}<p class="card-hint">Released: other computers can use it until you take it back.</p>
+  {{else if .HasButton}}<p class="card-hint">Press <kbd>Scan</kbd> on the scanner to {{if $paperless}}file straight into Paperless{{else}}drop a batch on the desk{{end}}.</p>{{end}}
+  {{if .CanRelease}}
+  <div class="card-actions">
+    {{if .Released}}
+    <button type="button" class="link-btn" hx-post="/scanners/{{.ID}}/take-back" hx-target="#status" hx-disable="this">Take back</button>
+    {{else}}
+    <span x-data="confirm">
+      <button type="button" class="link-btn" x-show="idle" @click="arm">Release</button>
+      <button type="button" class="link-btn armed" x-show="armed" x-cloak hx-post="/scanners/{{.ID}}/release" hx-target="#status" hx-disable="this">Tap again to release</button>
+    </span>
+    {{end}}
+  </div>
+  {{end}}
 </article>
 {{end}}
 {{if .HasPaperless}}
@@ -55,9 +55,9 @@
 {{define "job"}}<div class="job job-{{.State}}"{{if eq .State "running"}} hx-get="/jobs/{{.ID}}?seen={{.Pages}}" hx-trigger="every 1500ms" hx-swap="outerHTML"{{end}}>
   {{if eq .State "running"}}
   <div class="feed" aria-hidden="true"><i></i><i></i><i></i></div>
-  <p><strong>{{if eq .Scanner "epson"}}Scanning the glass…{{else}}Feeding sheets…{{end}}</strong> <span class="job-count">{{.Pages}} page{{if ne .Pages 1}}s{{end}} so far</span></p>
+  <p><strong>{{if eq .Kind "flatbed"}}Scanning the glass…{{else}}Feeding sheets…{{end}}</strong> <span class="job-count">{{.Pages}} page{{if ne .Pages 1}}s{{end}} so far</span></p>
   {{else if eq .State "done"}}
-  <p class="job-ok"><strong>✓ {{.Pages}} page{{if ne .Pages 1}}s{{end}} added.</strong>{{if eq .Scanner "epson"}} Turn the page and scan again for the next one.{{end}}</p>
+  <p class="job-ok"><strong>✓ {{.Pages}} page{{if ne .Pages 1}}s{{end}} added.</strong>{{if eq .Kind "flatbed"}} Turn the page and scan again for the next one.{{end}}</p>
   {{else}}
   <p class="job-bad"><strong>{{.Err}}</strong>{{if .Pages}} {{.Pages}} page{{if ne .Pages 1}}s were{{else}} was{{end}} kept.{{end}}</p>
   {{end}}

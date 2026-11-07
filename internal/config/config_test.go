@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/guigui42/scan-hub/internal/vens"
 )
 
 func env(m map[string]string) func(string) (string, bool) {
@@ -20,63 +18,40 @@ func TestDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.DataDir != "/data" || c.ListenAddr != "127.0.0.1:8097" || c.ScanSnapIP != "" {
+	if c.DataDir != "/data" || c.ListenAddr != "127.0.0.1:8097" || c.ScannersFile != "" {
 		t.Fatalf("%+v", c)
-	}
-	if c.Button.Quality != vens.QualitySuperFine || !c.Button.Duplex || c.Button.ColorMode != vens.ColorAuto || !c.Button.BlankPageRemoval {
-		t.Fatalf("button profile %+v", c.Button)
-	}
-}
-
-func TestPasswordRequiredAndFile(t *testing.T) {
-	if _, err := load(env(map[string]string{"SCANHUB_SCANSNAP_IP": "192.168.1.50"})); err == nil {
-		t.Fatal("missing password accepted")
-	}
-	f := filepath.Join(t.TempDir(), "pw")
-	os.WriteFile(f, []byte("s3cr\n"), 0o600)
-	c, err := load(env(map[string]string{"SCANHUB_SCANSNAP_IP": "192.168.1.50", "SCANHUB_SCANSNAP_PASSWORD_FILE": f}))
-	if err != nil || c.ScanSnapPassword != "s3cr" {
-		t.Fatalf("%v %q", err, c.ScanSnapPassword)
-	}
-	if _, err := load(env(map[string]string{"SCANHUB_SCANSNAP_PASSWORD": "a", "SCANHUB_SCANSNAP_PASSWORD_FILE": f})); err == nil {
-		t.Fatal("both forms accepted")
 	}
 }
 
 func TestInvalidValues(t *testing.T) {
-	_, err := load(env(map[string]string{
-		"SCANHUB_BUTTON_DPI": "600", "SCANHUB_BUTTON_COLOR": "pink", "SCANHUB_DATA_DIR": "rel",
-		"SCANHUB_SCANSNAP_IP": "scanner.local", "SCANHUB_SCANSNAP_PASSWORD": "x",
-	}))
-	for _, want := range []string{"DPI", "COLOR", "DATA_DIR", "SCANSNAP_IP"} {
+	_, err := load(env(map[string]string{"SCANHUB_DATA_DIR": "rel", "SCANHUB_SCANNERS_FILE": "scanners.yaml"}))
+	for _, want := range []string{"DATA_DIR", "SCANNERS_FILE"} {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("missing %s in %v", want, err)
 		}
 	}
 }
 
-func TestLogValueRedactsPassword(t *testing.T) {
-	c, _ := load(env(map[string]string{"SCANHUB_SCANSNAP_IP": "192.168.1.50", "SCANHUB_SCANSNAP_PASSWORD": "topsecret"}))
-	var b bytes.Buffer
-	slog.New(slog.NewTextHandler(&b, nil)).Info("cfg", "config", c)
-	if strings.Contains(b.String(), "topsecret") {
-		t.Fatal("password logged")
+func TestLegacyScannerVarsRejected(t *testing.T) {
+	_, err := load(env(map[string]string{"SCANHUB_SCANSNAP_IP": "192.168.1.50", "SCANHUB_EPSON_URL": "https://192.168.1.60", "SCANHUB_EPSON_DPI": ""}))
+	if err == nil || !strings.Contains(err.Error(), "SCANHUB_SCANSNAP_IP, SCANHUB_EPSON_URL: scanners are now configured") {
+		t.Fatalf("got %v", err)
+	}
+	// The password may still live in an environment variable named by the list.
+	if _, err := load(env(map[string]string{"SCANHUB_SCANSNAP_PASSWORD": "x", "SCANHUB_SCANNERS_FILE": "/etc/scan-hub/scanners.yaml"})); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestEpson(t *testing.T) {
-	if _, err := load(env(map[string]string{"SCANHUB_EPSON_URL": "https://192.168.1.60"})); err == nil {
-		t.Fatal("https without pin accepted")
+func TestSecretFile(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "tok")
+	os.WriteFile(f, []byte("tok-abc\n"), 0o600)
+	c, err := load(env(map[string]string{"SCANHUB_PAPERLESS_URL": "https://paperless.example", "SCANHUB_PAPERLESS_TOKEN_FILE": f}))
+	if err != nil || c.PaperlessToken != "tok-abc" {
+		t.Fatalf("%v %q", err, c.PaperlessToken)
 	}
-	c, err := load(env(map[string]string{"SCANHUB_EPSON_URL": "https://192.168.1.60", "SCANHUB_EPSON_TLS_PIN": "ab", "SCANHUB_EPSON_DPI": "600", "SCANHUB_EPSON_COLOR": "gray"}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Epson != (EpsonProfile{ColorMode: "Grayscale8", DPI: 600, Region: "a4"}) {
-		t.Fatalf("%+v", c.Epson)
-	}
-	if _, err := load(env(map[string]string{"SCANHUB_EPSON_REGION": "a3"})); err == nil {
-		t.Fatal("bad region accepted")
+	if _, err := load(env(map[string]string{"SCANHUB_PAPERLESS_TOKEN": "a", "SCANHUB_PAPERLESS_TOKEN_FILE": f})); err == nil {
+		t.Fatal("both forms accepted")
 	}
 }
 

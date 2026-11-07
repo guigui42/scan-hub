@@ -29,7 +29,8 @@ const (
 type Job struct {
 	ID        string
 	SessionID string
-	Scanner   string
+	Scanner   string // device id
+	Kind      string // scanner.Kind of the device, for the UI copy
 	State     JobState
 	Pages     int
 	Err       string
@@ -37,19 +38,20 @@ type Job struct {
 	Finished  time.Time
 }
 
-// jobs runs at most one scan per scanner. Scans outlive the HTTP request
+// jobs runs at most one scan per scanner and per session. Scans outlive the HTTP request
 // (htmx times out after 60 s); the page polls the job instead.
 type jobs struct {
 	ctx     context.Context
 	mu      sync.Mutex
 	byID    map[string]*Job
 	running map[string]string // scanner -> job ID
+	session map[string]string // session -> job ID of its running scan
 	locked  map[string]bool   // sessions being sent or deleted
 	wg      sync.WaitGroup
 }
 
 func newJobs(ctx context.Context) *jobs {
-	return &jobs{ctx: ctx, byID: map[string]*Job{}, running: map[string]string{}, locked: map[string]bool{}}
+	return &jobs{ctx: ctx, byID: map[string]*Job{}, running: map[string]string{}, session: map[string]string{}, locked: map[string]bool{}}
 }
 
 // lockSession reserves a session for a send/delete: it fails while a scan
@@ -57,13 +59,8 @@ func newJobs(ctx context.Context) *jobs {
 func (j *jobs) lockSession(sessionID string) (func(), error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.locked[sessionID] {
+	if _, scanning := j.session[sessionID]; scanning || j.locked[sessionID] {
 		return nil, errSessionBusy
-	}
-	for _, id := range j.running {
-		if j.byID[id].SessionID == sessionID {
-			return nil, errSessionBusy
-		}
 	}
 	j.locked[sessionID] = true
 	return func() {
@@ -74,21 +71,22 @@ func (j *jobs) lockSession(sessionID string) (func(), error) {
 }
 
 // start launches fn; it calls addPage() after each stored page.
-func (j *jobs) start(scanner, sessionID string, fn func(ctx context.Context, addPage func()) error) (Job, error) {
+func (j *jobs) start(scanner, kind, sessionID string, fn func(ctx context.Context, addPage func()) error) (Job, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if _, busy := j.running[scanner]; busy {
 		return Job{}, errScannerBusy
 	}
-	if j.locked[sessionID] {
+	if _, scanning := j.session[sessionID]; scanning || j.locked[sessionID] {
 		return Job{}, errSessionBusy
 	}
 	j.pruneLocked()
 	var b [8]byte
 	rand.Read(b[:])
-	job := &Job{ID: hex.EncodeToString(b[:]), SessionID: sessionID, Scanner: scanner, State: JobRunning, Started: time.Now()}
+	job := &Job{ID: hex.EncodeToString(b[:]), SessionID: sessionID, Scanner: scanner, Kind: kind, State: JobRunning, Started: time.Now()}
 	j.byID[job.ID] = job
 	j.running[scanner] = job.ID
+	j.session[sessionID] = job.ID
 	j.wg.Add(1)
 	go func() {
 		defer j.wg.Done()
@@ -105,6 +103,7 @@ func (j *jobs) start(scanner, sessionID string, fn func(ctx context.Context, add
 			job.State, job.Err = JobFailed, err.Error()
 		}
 		delete(j.running, scanner)
+		delete(j.session, sessionID)
 	}()
 	return *job, nil
 }
@@ -123,10 +122,8 @@ func (j *jobs) get(id string) (Job, bool) {
 func (j *jobs) runningFor(sessionID string) (Job, bool) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	for _, id := range j.running {
-		if job := j.byID[id]; job.SessionID == sessionID {
-			return *job, true
-		}
+	if id, ok := j.session[sessionID]; ok {
+		return *j.byID[id], true
 	}
 	return Job{}, false
 }

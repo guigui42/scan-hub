@@ -1,6 +1,6 @@
-// Command scan-hub-demo runs the real web UI against fake devices (a fake
-// ScanSnap, Epson and Paperless on loopback) for UI work and browser tests.
-// It never talks to real hardware.
+// Command scan-hub-demo runs the real web UI against fake devices (two
+// ScanSnaps, two eSCL scanners and a Paperless on loopback) for UI work and
+// browser tests. It never talks to real hardware.
 //
 //	go run ./cmd/scan-hub-demo -addr 127.0.0.1:8098
 package main
@@ -15,17 +15,19 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/guigui42/scan-hub/internal/config"
 	"github.com/guigui42/scan-hub/internal/escl"
 	"github.com/guigui42/scan-hub/internal/escl/escltest"
 	"github.com/guigui42/scan-hub/internal/paperless"
 	"github.com/guigui42/scan-hub/internal/paperless/paperlesstest"
+	"github.com/guigui42/scan-hub/internal/scanner"
+	"github.com/guigui42/scan-hub/internal/scanner/escldrv"
+	"github.com/guigui42/scan-hub/internal/scanner/scansnapdrv"
 	"github.com/guigui42/scan-hub/internal/scansnap"
 	"github.com/guigui42/scan-hub/internal/session"
-	"github.com/guigui42/scan-hub/internal/vens"
 	"github.com/guigui42/scan-hub/internal/vens/venstest"
 	"github.com/guigui42/scan-hub/internal/web"
 )
@@ -68,21 +70,48 @@ func run(addr, dir string, paper int) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	ss, err := venstest.Start(venstest.Options{Password: "demo", EndOfBatchQuirk: true, HeartbeatTimeout: 3 * time.Second})
-	if err != nil {
+	// Two fake ScanSnaps share one button listener and the discovery reply
+	// port, like real ones. The second needs 127.0.0.2 (Linux, or a lo0
+	// alias on macOS).
+	hub := scansnap.NewNotifyHub(0, log)
+	if err := hub.Listen(); err != nil {
 		return err
 	}
-	defer ss.Close()
-	ss.LoadPaper(paper)
-	mgr := scansnap.New(scansnap.Config{
-		ScannerIP: ss.IP(), Password: "demo", JournalPath: filepath.Join(dir, "scansnap", "journal.json"),
-		ControlPort: ss.ControlPort(), DataPort: ss.DataPort(), DiscoveryPort: ss.DiscoveryPort(),
-		DiscoveryReplyPort: freeUDP(), NotifyPort: freeUDP(), StatusInterval: 2 * time.Second, Logger: log,
-	})
-	done := make(chan struct{})
-	go func() { mgr.Run(ctx); close(done) }()
-	defer func() { stop(); <-done }()
-	// Keep the fake feeder stocked so every scan has paper.
+	defer hub.Close()
+	reply := freeUDP()
+	var (
+		devs  []scanner.Device
+		fakes []*venstest.Scanner
+		mgrs  []*scansnap.Manager
+		snaps sync.WaitGroup
+	)
+	for i, sn := range []struct{ id, name, ip string }{
+		{"feeder", "ScanSnap iX500", "127.0.0.1"},
+		{"feeder-2", "Second ScanSnap", "127.0.0.2"},
+	} {
+		ss, err := venstest.Start(venstest.Options{IP: sn.ip, Password: "demo", EndOfBatchQuirk: true, HeartbeatTimeout: 3 * time.Second, HeartbeatACK: true})
+		if err != nil {
+			if i == 0 {
+				return err
+			}
+			log.Warn("second fake ScanSnap disabled", "ip", sn.ip, "err", err, "hint", "macOS: sudo ifconfig lo0 alias "+sn.ip)
+			continue
+		}
+		defer ss.Close()
+		ss.LoadPaper(paper)
+		mgr := scansnap.New(scansnap.Config{
+			ScannerIP: ss.IP(), Password: "demo", JournalPath: scansnap.JournalPath(filepath.Join(dir, "scansnap"), sn.id),
+			ControlPort: ss.ControlPort(), DataPort: ss.DataPort(), DiscoveryPort: ss.DiscoveryPort(),
+			DiscoveryReplyPort: reply, Hub: hub, StatusInterval: 2 * time.Second, Logger: log.With("scanner", sn.id),
+		})
+		dev := scansnapdrv.NewDevice(sn.id, sn.name, mgr, scansnapdrv.DefaultConfig(), scansnapdrv.DefaultConfig())
+		snaps.Add(1)
+		go func() { defer snaps.Done(); dev.Run(ctx) }()
+		devs, fakes, mgrs = append(devs, dev), append(fakes, ss), append(mgrs, mgr)
+	}
+	// Runs first: the managers release the fakes before they and the hub close.
+	defer func() { stop(); snaps.Wait() }()
+	// Keep the fake feeders stocked so every scan has paper.
 	go func() {
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
@@ -91,18 +120,23 @@ func run(addr, dir string, paper int) error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if mgr.Status().State == scansnap.StateClaimed {
-					ss.LoadPaper(paper)
+				for i, m := range mgrs {
+					if m.Status().State == scansnap.StateClaimed {
+						fakes[i].LoadPaper(paper)
+					}
 				}
 			}
 		}
 	}()
 
-	ep := escltest.Start()
-	defer ep.Close()
-	epc, err := escl.New(escl.Options{BaseURL: ep.URL, TLSPin: escl.SPKIPin(ep.Certificate()), Logger: log})
-	if err != nil {
-		return err
+	for _, ep := range []struct{ id, name string }{{"glass", "Epson ET-2750"}, {"glass-2", "Office AirScan"}} {
+		f := escltest.Start()
+		defer f.Close()
+		c, err := escl.New(escl.Options{BaseURL: f.URL, TLSPin: escl.SPKIPin(f.Certificate()), Logger: log.With("scanner", ep.id)})
+		if err != nil {
+			return err
+		}
+		devs = append(devs, escldrv.NewDevice(ep.id, ep.name, c, escldrv.DefaultProfile, 0))
 	}
 
 	pl := paperlesstest.Start("demo")
@@ -122,16 +156,12 @@ func run(addr, dir string, paper int) error {
 	if err != nil {
 		return err
 	}
-	btn := vens.DefaultScanConfig()
-	btn.Quality = vens.QualitySuperFine
 	ui, err := web.New(ctx, web.Config{
 		AllowedHosts: []string{addr, "localhost:" + port},
 		KeyPath:      filepath.Join(dir, "web", "csrf.key"),
-		ScanSnap:     btn,
-		Epson:        config.EpsonProfile{ColorMode: escl.ColorRGB24, DPI: 300, Region: "a4"},
 		PaperlessURL: "https://paperless.example",
 		Logger:       log,
-	}, web.Deps{ScanSnap: mgr, Epson: epc, Store: store, Outbox: ob, Paperless: pc, DataDir: dir})
+	}, web.Deps{Scanners: devs, Store: store, Outbox: ob, Paperless: pc, DataDir: dir})
 	if err != nil {
 		return err
 	}

@@ -18,19 +18,14 @@ document.addEventListener('alpine:init', () => {
     close() { this.$root.remove() },
   }))
 
+  // The session page shows one scan form per scanner; `scanner` is the id
+  // of the visible one.
   Alpine.data('sessionPage', () => ({
-    scanner: 'scansnap',
+    scanner: '',
     lightbox: false,
     lightboxSrc: '',
 
-    init() { this.scanner = this.$root.dataset.scanner || 'scansnap' },
-
-    get isScanSnap() { return this.scanner === 'scansnap' },
-    get isEpson() { return this.scanner === 'epson' },
-    get ssPressed() { return this.isScanSnap ? 'true' : 'false' },
-    get epPressed() { return this.isEpson ? 'true' : 'false' },
-    useScanSnap() { this.scanner = 'scansnap' },
-    useEpson() { this.scanner = 'epson' },
+    init() { this.scanner = this.$root.dataset.scanner || '' },
 
     openLightbox(e) {
       this.lightboxSrc = e.currentTarget.dataset.full
@@ -40,5 +35,13 @@ document.addEventListener('alpine:init', () => {
       this.lightbox = false
       this.lightboxSrc = ''
     },
+  }))
+
+  // A switch button or scan form of one scanner (data-scanner on its root),
+  // nested in sessionPage.
+  Alpine.data('scannerPane', () => ({
+    get shown() { return this.scanner === this.$root.dataset.scanner },
+    get pressed() { return this.shown ? 'true' : 'false' },
+    pick() { this.scanner = this.$root.dataset.scanner },
   }))
 })

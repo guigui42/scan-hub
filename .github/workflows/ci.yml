@@ -67,9 +67,16 @@ jobs:
           tags: scan-hub:ci
           build-args: VERSION=ci-${{ github.sha }}
       - name: Smoke-run the hardened container
+        # A mounted scanner list with a password file, both readable by the
+        # image's user only; the scanners are unreachable loopback addresses.
         run: |
+          mkdir -p smoke
+          printf 'scanners:\n  - id: feeder\n    type: scansnap\n    ip: 127.0.0.2\n    password_file: /config/pw\n  - id: glass\n    type: escl\n    url: http://127.0.0.1:9\n' > smoke/scanners.yaml
+          printf '1234\n' > smoke/pw
+          sudo chown -R 65532:65532 smoke && sudo chmod 0400 smoke/scanners.yaml smoke/pw
           docker run -d --name smoke --network host --read-only --cap-drop ALL \
             --security-opt no-new-privileges:true --tmpfs /tmp \
+            -v "$PWD/smoke:/config:ro" -e SCANHUB_SCANNERS_FILE=/config/scanners.yaml \
             -e SCANHUB_LISTEN_ADDR=127.0.0.1:8097 scan-hub:ci
           for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:8097/readyz && break; sleep 1; done
           curl -fsS http://127.0.0.1:8097/readyz

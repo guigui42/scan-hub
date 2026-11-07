@@ -95,7 +95,7 @@ func New(o Options) (*Client, error) {
 			// Never follow redirects off the configured device.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
-		log: o.Logger.With("component", "escl", "scanner", u.Host),
+		log: o.Logger.With("component", "escl", "host", u.Host),
 	}, nil
 }
 

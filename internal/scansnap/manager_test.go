@@ -116,7 +116,7 @@ func TestClaimButtonScanRelease(t *testing.T) {
 	if st.DeviceName != "FUJITSU ScanSnap iX500" || st.Firmware != "0U00" || st.WifiSignal != 3 {
 		t.Fatalf("status %+v", st)
 	}
-	js, _ := journal{jp}.load()
+	js, _ := journal{path: jp}.load()
 	if !js.Dirty {
 		t.Fatal("journal should be dirty while claimed")
 	}
@@ -162,7 +162,7 @@ func TestClaimButtonScanRelease(t *testing.T) {
 	if _, held := f.Holder(); held {
 		t.Fatal("scanner still held after shutdown")
 	}
-	js, _ = journal{jp}.load()
+	js, _ = journal{path: jp}.load()
 	if js.Dirty {
 		t.Fatal("journal dirty after clean shutdown")
 	}
@@ -252,7 +252,7 @@ func TestBadPasswordDoesNotHammer(t *testing.T) {
 	if n := f.Stats().Reserves; n != 1 {
 		t.Fatalf("RESERVE sent %d times", n)
 	}
-	js, _ := journal{jp}.load()
+	js, _ := journal{path: jp}.load()
 	if js.Dirty {
 		t.Fatal("journal dirty after rejected RESERVE")
 	}
@@ -263,7 +263,7 @@ func TestRecoverWithJournalToken(t *testing.T) {
 	jp := filepath.Join(t.TempDir(), "j.json")
 	// A previous scan-hub process crashed while holding the scanner.
 	stale := vens.NewToken()
-	if err := (journal{jp}).begin(stale); err != nil {
+	if err := (journal{path: jp}).begin(stale); err != nil {
 		t.Fatal(err)
 	}
 	f.Occupy(stale, net.IPv4(127, 0, 0, 1), 2*time.Second)
@@ -291,7 +291,7 @@ func TestForeignHolderBacksOffThenClaims(t *testing.T) {
 	if st.Holder != "127.0.0.1" {
 		t.Fatalf("holder %q", st.Holder)
 	}
-	js, _ := journal{jp}.load()
+	js, _ := journal{path: jp}.load()
 	if js.Dirty {
 		t.Fatal("journal must not stay dirty for a token we never held")
 	}
@@ -320,14 +320,14 @@ func TestLostContactThenReclaimSameToken(t *testing.T) {
 	first, _ := f.Holder()
 	f.Close()
 	waitState(t, r.m, StateConnecting)
-	js, _ := journal{jp}.load()
+	js, _ := journal{path: jp}.load()
 	if !js.Dirty || js.Token != hex.EncodeToString(first[:]) {
 		t.Fatalf("journal should keep the held token dirty: %+v", js)
 	}
 }
 
 func TestJournalNeverOverwritesDirtyToken(t *testing.T) {
-	j := journal{filepath.Join(t.TempDir(), "j.json")}
+	j := journal{path: filepath.Join(t.TempDir(), "j.json")}
 	a, b := vens.NewToken(), vens.NewToken()
 	if err := j.begin(a); err != nil {
 		t.Fatal(err)
@@ -360,5 +360,104 @@ func TestParseButton(t *testing.T) {
 	p[11] = 2
 	if _, ok := parseButton(p); ok {
 		t.Fatal("wrong type accepted")
+	}
+}
+
+// After a power cycle another client may hold the scanner: RESERVE with the
+// journal token gets -4 and the RELEASE with it is refused. The manager must
+// not loop on that token: it reports the holder, forgets the token, and
+// claims with a fresh one once the scanner is free.
+func TestRefusedReleaseOfJournalTokenFallsBackToHeldByOther(t *testing.T) {
+	f := startFake(t, venstest.Options{HeartbeatTimeout: time.Second, CloseOnForeignRelease: true})
+	jp := filepath.Join(t.TempDir(), "j.json")
+	mine := vens.NewToken()
+	if err := (journal{path: jp}).begin(mine); err != nil {
+		t.Fatal(err)
+	}
+	other := vens.NewToken()
+	f.Occupy(other, net.IPv4(127, 0, 0, 1), 800*time.Millisecond)
+
+	r := run(t, testConfig(t, f, jp))
+	st := waitState(t, r.m, StateHeldByOther)
+	if st.Holder != "127.0.0.1" {
+		t.Fatalf("status %+v", st)
+	}
+	if js, _ := (journal{path: jp}).load(); js.Dirty {
+		t.Fatal("journal token kept after the scanner refused its release")
+	}
+	waitState(t, r.m, StateClaimed)
+	if holder, _ := f.Holder(); holder == mine || holder == other {
+		t.Fatalf("expected a fresh token, holder %x", holder)
+	}
+	noForbidden(t, f)
+}
+
+func TestReleaseAndTakeBackSurviveRestart(t *testing.T) {
+	f := startFake(t, venstest.Options{})
+	jp := filepath.Join(t.TempDir(), "j.json")
+	r := run(t, testConfig(t, f, jp))
+	waitState(t, r.m, StateClaimed)
+
+	ctx := context.Background()
+	if err := r.m.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if st := r.m.Status(); st.State != StateReleased {
+		t.Fatalf("state %s", st.State)
+	}
+	if _, held := f.Holder(); held {
+		t.Fatal("scanner still held after Release")
+	}
+	if js, _ := (journal{path: jp}).load(); js.Dirty || !js.Released {
+		t.Fatalf("journal %+v", js)
+	}
+	if err := r.m.Release(ctx); err != nil {
+		t.Fatal("second Release must be a no-op:", err)
+	}
+	reserves := f.Stats().Reserves
+	time.Sleep(300 * time.Millisecond) // well past RetryMin: no reclaim
+	if f.Stats().Reserves != reserves {
+		t.Fatal("reclaimed while released")
+	}
+	r.stop()
+
+	// A restart stays released.
+	r2 := run(t, testConfig(t, f, jp))
+	waitState(t, r2.m, StateReleased)
+	time.Sleep(300 * time.Millisecond)
+	if f.Stats().Reserves != reserves {
+		t.Fatal("claimed after restart while released")
+	}
+	if err := r2.m.TakeBack(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, r2.m, StateClaimed)
+	if js, _ := (journal{path: jp}).load(); js.Released || !js.Dirty {
+		t.Fatalf("journal after take back %+v", js)
+	}
+	for _, a := range f.Stats().ReleaseActions {
+		if a != 0 {
+			t.Fatalf("non-normal RELEASE action %d", a)
+		}
+	}
+	noForbidden(t, f)
+}
+
+func TestReleaseRefusedWhileScanning(t *testing.T) {
+	f := startFake(t, venstest.Options{WaitDelay: 500 * time.Millisecond})
+	r := run(t, testConfig(t, f, filepath.Join(t.TempDir(), "j.json")))
+	waitState(t, r.m, StateClaimed)
+	f.LoadPaper(1)
+	done := make(chan ScanResult, 1)
+	go func() {
+		done <- r.m.Scan(context.Background(), ScanRequest{Config: vens.DefaultScanConfig(), OnPage: func(Page) error { return nil }})
+	}()
+	waitState(t, r.m, StateScanning)
+	if err := r.m.Release(context.Background()); !errors.Is(err, ErrBusy) {
+		t.Fatalf("release during scan: %v", err)
+	}
+	<-done
+	if err := r.m.Release(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -37,6 +38,22 @@ func GetLocalIP(targetIP string) string {
 	return addr.IP.String()
 }
 
+// discoveryGates holds one single-slot semaphore per local reply port.
+var discoveryGates sync.Map // int -> chan struct{}
+
+// acquireDiscoveryPort waits for exclusive use of a local discovery port
+// within this process, or for ctx to end.
+func acquireDiscoveryPort(ctx context.Context, port int) (func(), error) {
+	g, _ := discoveryGates.LoadOrStore(port, make(chan struct{}, 1))
+	gate := g.(chan struct{})
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // DiscoveryOptions configures scanner discovery.
 type DiscoveryOptions struct {
 	ScannerIP   string // Empty for broadcast discovery
@@ -57,15 +74,22 @@ func FindScannerRaw(ctx context.Context, opts DiscoveryOptions) (*DeviceInfo, []
 	if opts.Timeout == 0 {
 		opts.Timeout = 10 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
-	defer cancel()
-
 	if opts.ScannerPort == 0 {
 		opts.ScannerPort = DiscoveryPort
 	}
 	if opts.ListenPort == 0 {
 		opts.ListenPort = ClientDiscoveryPort
 	}
+	// Several scanners share the local reply port: take turns. The timeout
+	// starts once the port is ours, so waiting does not eat into it.
+	release, err := acquireDiscoveryPort(ctx, opts.ListenPort)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	defer cancel()
+
 	localIP := GetLocalIP(opts.ScannerIP)
 
 	// Bind to client discovery port

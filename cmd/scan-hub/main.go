@@ -18,12 +18,10 @@ import (
 	"time"
 
 	"github.com/guigui42/scan-hub/internal/config"
-	"github.com/guigui42/scan-hub/internal/escl"
 	"github.com/guigui42/scan-hub/internal/paperless"
 	"github.com/guigui42/scan-hub/internal/pipeline"
-	"github.com/guigui42/scan-hub/internal/scansnap"
+	"github.com/guigui42/scan-hub/internal/scanner"
 	"github.com/guigui42/scan-hub/internal/session"
-	"github.com/guigui42/scan-hub/internal/vens"
 	"github.com/guigui42/scan-hub/internal/web"
 )
 
@@ -32,7 +30,7 @@ var version = "dev"
 
 func main() {
 	if len(os.Args) > 1 {
-		cmds := map[string]func([]string) error{"send": sendCmd, "pdf": pdfCmd, "scan-epson": scanEpsonCmd}
+		cmds := map[string]func([]string) error{"send": sendCmd, "pdf": pdfCmd, "scan": scanCmd}
 		switch name := os.Args[1]; {
 		case name == "version" || name == "--version":
 			fmt.Println(version)
@@ -46,7 +44,7 @@ func main() {
 			}
 			return
 		default:
-			fmt.Fprintln(os.Stderr, "usage: scan-hub [version | healthcheck | send <session> | pdf <session> | scan-epson]")
+			fmt.Fprintln(os.Stderr, "usage: scan-hub [version | healthcheck | send <session> | pdf <session> | scan <scanner>]")
 			os.Exit(2)
 		}
 	}
@@ -59,24 +57,32 @@ func main() {
 // workers tracks background goroutines for /readyz.
 type workers struct {
 	mu    sync.Mutex
-	alive map[string]*atomic.Bool
+	alive map[string]*worker
 	wg    sync.WaitGroup
 }
 
-func (w *workers) start(name string, fn func()) {
+type worker struct {
+	alive atomic.Bool
+	err   atomic.Pointer[error]
+}
+
+// start runs fn; its error is reported by ready once it has stopped.
+func (w *workers) start(name string, fn func() error) {
 	w.mu.Lock()
 	if w.alive == nil {
-		w.alive = map[string]*atomic.Bool{}
+		w.alive = map[string]*worker{}
 	}
-	b := &atomic.Bool{}
-	b.Store(true)
-	w.alive[name] = b
+	st := &worker{}
+	st.alive.Store(true)
+	w.alive[name] = st
 	w.mu.Unlock()
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
-		defer b.Store(false)
-		fn()
+		defer st.alive.Store(false)
+		if err := fn(); err != nil {
+			st.err.Store(&err)
+		}
 	}()
 }
 
@@ -84,8 +90,11 @@ func (w *workers) ready() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var dead []string
-	for name, b := range w.alive {
-		if !b.Load() {
+	for name, st := range w.alive {
+		if !st.alive.Load() {
+			if err := st.err.Load(); err != nil {
+				name += " (" + (*err).Error() + ")"
+			}
 			dead = append(dead, name)
 		}
 	}
@@ -111,20 +120,27 @@ func run() error {
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	devs, ssd, err := loadScanners(cfg, log)
+	if err != nil {
+		stop()
+		return fmt.Errorf("scanners: %w", err)
+	}
 	var (
 		w  workers
 		pc *paperless.Client
 		ob *paperless.Outbox
 		ui *web.Server
 	)
-	// Shutdown order: stop work, let scan jobs and workers finish (the
-	// ScanSnap is released by its actor), then drop the outbox lock.
+	// Shutdown order: stop work, let scan jobs and workers finish (each
+	// ScanSnap is released by its actor), close the shared button listener,
+	// then drop the outbox lock.
 	defer func() {
 		stop()
 		if ui != nil {
 			ui.Wait()
 		}
 		w.wg.Wait()
+		ssd.Close()
 		if ob != nil {
 			ob.Close()
 		}
@@ -134,52 +150,51 @@ func run() error {
 		if pc, ob, err = openOutbox(cfg, log); err != nil {
 			return fmt.Errorf("outbox: %w", err)
 		}
-		w.start("outbox", func() { ob.Run(ctx) })
+		w.start("outbox", func() error { ob.Run(ctx); return nil })
 	} else {
 		log.Warn("SCANHUB_PAPERLESS_URL not set: uploads disabled")
 	}
 
-	var ep *escl.Client
-	if cfg.EpsonURL != "" {
-		if ep, err = newEpson(cfg, log); err != nil {
-			return err
-		}
-	} else {
-		log.Warn("SCANHUB_EPSON_URL not set: Epson disabled")
+	if len(devs) == 0 {
+		log.Warn("no scanners configured (SCANHUB_SCANNERS_FILE): only the outbox works")
 	}
-
-	var ss *scansnap.Manager
-	if cfg.ScanSnapIP != "" {
-		ss = scansnap.New(scansnap.Config{
-			ScannerIP:   cfg.ScanSnapIP,
-			Password:    cfg.ScanSnapPassword,
-			JournalPath: filepath.Join(cfg.DataDir, "scansnap", "journal.json"),
-			Logger:      log,
-		})
-		runErr := make(chan error, 1)
-		w.start("scansnap", func() { runErr <- ss.Run(ctx) })
-		// Surface an immediate startup failure (e.g. UDP 55265 in use).
-		select {
-		case err := <-runErr:
-			if err != nil {
+	if err := ssd.PrepareJournals(); err != nil {
+		return fmt.Errorf("ScanSnap journals: %w", err)
+	}
+	// Bound before any ScanSnap runs, so a port conflict stops startup here.
+	if err := ssd.Listen(); err != nil {
+		return err
+	}
+	runErrs := make(chan error, len(devs))
+	for _, d := range devs {
+		log.Info("scanner", "id", d.ID(), "name", d.Name(), "kind", d.Kind())
+		if r, ok := d.(scanner.Runner); ok {
+			w.start("scanner:"+d.ID(), func() error {
+				err := r.Run(ctx)
+				if err != nil {
+					runErrs <- fmt.Errorf("scanner %s: %w", d.ID(), err)
+				}
 				return err
-			}
-		case <-time.After(200 * time.Millisecond):
+			})
 		}
-		w.start("button", func() { buttonLoop(ctx, log, ss, store, ob, cfg) })
-	} else {
-		log.Warn("SCANHUB_SCANSNAP_IP not set: ScanSnap disabled")
+		if b, ok := d.(scanner.Button); ok {
+			w.start("button:"+d.ID(), func() error { buttonLoop(ctx, log, d, b, store, ob); return nil })
+		}
 	}
-	w.start("cleanup", func() { cleanupLoop(ctx, log, store, cfg.SessionMaxAge) })
+	// Surface an immediate startup failure of a scanner.
+	select {
+	case err := <-runErrs:
+		return err
+	case <-time.After(200 * time.Millisecond):
+	}
+	w.start("cleanup", func() error { cleanupLoop(ctx, log, store, cfg.SessionMaxAge); return nil })
 
 	ui, err = web.New(ctx, web.Config{
 		AllowedHosts: cfg.AllowedHosts,
 		KeyPath:      filepath.Join(cfg.DataDir, "web", "csrf.key"),
-		ScanSnap:     cfg.Button,
-		Epson:        cfg.Epson,
 		PaperlessURL: cfg.PaperlessURL,
 		Logger:       log,
-	}, web.Deps{ScanSnap: ss, Epson: ep, Store: store, Outbox: ob, Paperless: pc, Ready: w.ready, DataDir: cfg.DataDir})
+	}, web.Deps{Scanners: devs, Store: store, Outbox: ob, Paperless: pc, Ready: w.ready, DataDir: cfg.DataDir})
 	if err != nil {
 		return err
 	}
@@ -212,49 +227,59 @@ func run() error {
 	return nil
 }
 
-// buttonLoop turns each physical Scan press into a batch with the button
-// profile. A clean batch goes straight to the Paperless outbox; a batch that
-// stopped early (jam, multi-feed) stays on the desk for review.
-func buttonLoop(ctx context.Context, log *slog.Logger, ss *scansnap.Manager, store *session.Store, ob *paperless.Outbox, cfg config.Config) {
+// buttonLoop turns each press of a scanner's own Scan button into a batch
+// with its button profile. A clean batch goes straight to the Paperless
+// outbox; a batch that stopped early (jam, multi-feed) stays on the desk for
+// review. It returns when the device stops.
+func buttonLoop(ctx context.Context, log *slog.Logger, dev scanner.Device, b scanner.Button, store *session.Store, ob *paperless.Outbox) {
+	log = log.With("scanner", dev.ID())
 	for {
+		var ev scanner.ButtonEvent
 		select {
 		case <-ctx.Done():
 			return
-		case ev := <-ss.Buttons():
-			if st := ss.Status().State; st != scansnap.StateClaimed {
-				log.Warn("button press ignored", "state", st, "seq", ev.Seq)
-				continue
+		case e, ok := <-b.Buttons():
+			if !ok {
+				return
 			}
-			// The session is created with the first page, so a press with an
-			// empty feeder leaves nothing behind.
-			var id string
-			res := ss.Scan(ctx, scansnap.ScanRequest{Config: cfg.Button, OnPage: func(p scansnap.Page) error {
-				if id == "" {
-					m, err := store.Create("scansnap-button")
-					if err != nil {
-						return err
-					}
-					id = m.ID
+			ev = e
+		}
+		if err := dev.Ready(); err != nil {
+			log.Warn("button press ignored", "reason", err.Error(), "seq", ev.Seq)
+			continue
+		}
+		// The session is created with the first page, so a press with an
+		// empty feeder leaves nothing behind.
+		var id string
+		pages := 0
+		err := dev.Scan(ctx, b.ButtonSettings(), func(p scanner.Page) error {
+			if id == "" {
+				m, err := store.Create("button:" + dev.ID())
+				if err != nil {
+					return err
 				}
-				_, err := store.AddPage(id, p.Data, "scansnap", p.Sheet, p.Side)
+				id = m.ID
+			}
+			if _, err := store.AddPage(id, p.Data, dev.ID(), p.Sheet, p.Side); err != nil {
 				return err
-			}})
-			var se *vens.ScanError
-			switch {
-			case errors.Is(res.Err, scansnap.ErrBusy):
-				log.Warn("button press ignored: scan already running", "seq", ev.Seq)
-			case errors.As(res.Err, &se) && (se.Kind == vens.ScanErrNoPaper || se.Kind == vens.ScanErrCoverOpen):
-				log.Warn("button press: "+se.Msg, "seq", ev.Seq)
-			case res.Err != nil:
-				log.Error("button scan stopped early; pages kept on the desk", "session", id, "pages", res.Pages, "err", res.Err)
-			case id == "":
-				log.Warn("button scan produced no pages", "seq", ev.Seq)
-			case ob == nil:
-				log.Info("button scan stored (Paperless not configured)", "session", id, "pages", res.Pages)
-			default:
-				if _, err := pipeline.Submit(log, store, ob, id); err != nil {
-					log.Error("button scan: hand-off to outbox failed; pages kept on the desk", "session", id, "err", err)
-				}
+			}
+			pages++
+			return nil
+		})
+		switch {
+		case errors.Is(err, scanner.ErrBusy):
+			log.Warn("button press ignored: scan already running", "seq", ev.Seq)
+		case errors.Is(err, scanner.ErrNoPaper), errors.Is(err, scanner.ErrCoverOpen):
+			log.Warn("button press: "+err.Error(), "seq", ev.Seq)
+		case err != nil:
+			log.Error("button scan stopped early; pages kept on the desk", "session", id, "pages", pages, "err", err)
+		case id == "":
+			log.Warn("button scan produced no pages", "seq", ev.Seq)
+		case ob == nil:
+			log.Info("button scan stored (Paperless not configured)", "session", id, "pages", pages)
+		default:
+			if _, err := pipeline.Submit(log, store, ob, id); err != nil {
+				log.Error("button scan: hand-off to outbox failed; pages kept on the desk", "session", id, "err", err)
 			}
 		}
 	}

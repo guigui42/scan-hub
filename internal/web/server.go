@@ -23,14 +23,11 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/guigui42/scan-hub/internal/config"
-	"github.com/guigui42/scan-hub/internal/escl"
 	"github.com/guigui42/scan-hub/internal/paperless"
 	"github.com/guigui42/scan-hub/internal/pdf"
 	"github.com/guigui42/scan-hub/internal/pipeline"
-	"github.com/guigui42/scan-hub/internal/scansnap"
+	"github.com/guigui42/scan-hub/internal/scanner"
 	"github.com/guigui42/scan-hub/internal/session"
-	"github.com/guigui42/scan-hub/internal/vens"
 )
 
 //go:embed templates/*.html
@@ -43,8 +40,6 @@ var staticFS embed.FS
 type Config struct {
 	AllowedHosts []string
 	KeyPath      string // CSRF HMAC key file
-	ScanSnap     vens.ScanConfig
-	Epson        config.EpsonProfile
 	Version      string // cache-busting for /static
 	PaperlessURL string // for links to filed documents
 	Logger       *slog.Logger
@@ -52,8 +47,7 @@ type Config struct {
 
 // Deps are the services the UI drives; nil ones are shown as absent.
 type Deps struct {
-	ScanSnap  *scansnap.Manager
-	Epson     *escl.Client
+	Scanners  []scanner.Device // in display order
 	Store     *session.Store
 	Outbox    *paperless.Outbox
 	Paperless *paperless.Client
@@ -70,8 +64,7 @@ type Server struct {
 	pages map[string]*template.Template
 	jobs  *jobs
 
-	epsonCache cached[epsonStatus]
-	plCache    cached[plStatus]
+	plCache cached[plStatus]
 }
 
 // New builds the server. ctx bounds background scan jobs.
@@ -109,6 +102,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /{$}", s.home)
 	mux.HandleFunc("GET /fragments/status", s.statusFragment)
 	mux.HandleFunc("GET /fragments/desk", s.deskFragment)
+	mux.HandleFunc("POST /scanners/{id}/release", s.releaseScanner(true))
+	mux.HandleFunc("POST /scanners/{id}/take-back", s.releaseScanner(false))
 	mux.HandleFunc("POST /sessions", s.createSession)
 	mux.HandleFunc("GET /sessions/{id}", s.sessionPage)
 	mux.HandleFunc("GET /sessions/{id}/pages", s.pagesFragment)
@@ -153,18 +148,23 @@ func (c *cached[T]) get(ttl time.Duration, load func() T) T {
 	return c.val
 }
 
-type epsonStatus struct{ State, Detail string }
-
 type plStatus struct {
 	Reachable bool
 	Detail    string
 }
 
+// deviceView is one scanner card or ticket.
+type deviceView struct {
+	ID, Name   string
+	Kind       scanner.Kind
+	Status     scanner.Status
+	HasButton  bool
+	CanRelease bool
+	Released   bool
+}
+
 type statusView struct {
-	HasScanSnap  bool
-	ScanSnap     scansnap.Status
-	HasEpson     bool
-	Epson        epsonStatus
+	Scanners     []deviceView
 	HasPaperless bool
 	Paperless    plStatus
 	Waiting      int // outbox items not yet delivered
@@ -175,21 +175,23 @@ func (s *Server) status(reqCtx context.Context) statusView {
 	// Cached probes must not inherit the request's cancellation, or an
 	// aborted poll would be cached as "unreachable".
 	ctx := context.WithoutCancel(reqCtx)
-	v := statusView{HasScanSnap: s.d.ScanSnap != nil, HasEpson: s.d.Epson != nil, HasPaperless: s.d.Outbox != nil}
-	if v.HasScanSnap {
-		v.ScanSnap = s.d.ScanSnap.Status()
+	v := statusView{Scanners: make([]deviceView, len(s.d.Scanners)), HasPaperless: s.d.Outbox != nil}
+	// Probe concurrently: one slow scanner must not delay the others.
+	var wg sync.WaitGroup
+	for i, d := range s.d.Scanners {
+		_, hasButton := d.(scanner.Button)
+		rel, canRelease := d.(scanner.Releaser)
+		v.Scanners[i] = deviceView{ID: d.ID(), Name: d.Name(), Kind: d.Kind(), HasButton: hasButton, CanRelease: canRelease}
+		if canRelease {
+			v.Scanners[i].Released = rel.Released()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			v.Scanners[i].Status = d.Status(ctx)
+		}()
 	}
-	if v.HasEpson {
-		v.Epson = s.epsonCache.get(10*time.Second, func() epsonStatus {
-			c, cancel := context.WithTimeout(ctx, 3*time.Second)
-			defer cancel()
-			st, err := s.d.Epson.Status(c)
-			if err != nil {
-				return epsonStatus{State: "Unreachable", Detail: err.Error()}
-			}
-			return epsonStatus{State: st.State}
-		})
-	}
+	defer wg.Wait()
 	if v.HasPaperless {
 		v.Paperless = s.plCache.get(30*time.Second, func() plStatus {
 			c, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -316,6 +318,35 @@ func (s *Server) statusFragment(w http.ResponseWriter, r *http.Request) {
 	s.fragment(w, http.StatusOK, "status", s.status(r.Context()))
 }
 
+// releaseScanner lets another computer use a scanner, or takes it back, and
+// answers with the refreshed device cards.
+func (s *Server) releaseScanner(release bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		dev, ok := scanner.Find(s.d.Scanners, r.PathValue("id"))
+		rel, can := dev.(scanner.Releaser)
+		if !ok || !can {
+			s.fail(w, r, http.StatusNotFound, "That scanner can't be released.")
+			return
+		}
+		var err error
+		if release {
+			err = rel.Release(r.Context())
+		} else {
+			err = rel.TakeBack(r.Context())
+		}
+		switch {
+		case errors.Is(err, scanner.ErrBusy):
+			s.fail(w, r, http.StatusConflict, err.Error())
+			return
+		case err != nil:
+			s.fail(w, r, http.StatusInternalServerError, err.Error())
+			return
+		}
+		s.log.Info("scanner "+map[bool]string{true: "released", false: "taken back"}[release], "scanner", dev.ID())
+		s.fragment(w, http.StatusOK, "status", s.status(r.Context()))
+	}
+}
+
 func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		s.fail(w, r, http.StatusBadRequest, "Bad form.")
@@ -327,24 +358,27 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	to := "/sessions/" + m.ID
-	if sc := r.PostFormValue("scanner"); sc == "scansnap" || sc == "epson" {
-		to += "?scanner=" + sc
+	if sc := r.PostFormValue("scanner"); sc != "" {
+		if _, ok := scanner.Find(s.d.Scanners, sc); ok {
+			to += "?scanner=" + sc
+		}
 	}
 	redirect(w, r, to)
 }
 
 type sessionView struct {
-	M              session.Manifest
-	DefaultScanner string
-	Job            *Job
-	SS             struct {
-		Color, DPI, Paper string
-		Duplex, Blank     bool
-	}
-	EP          struct{ Color, DPI, Region string }
-	HasScanSnap bool
-	HasEpson    bool
-	HasOutbox   bool
+	M         session.Manifest
+	Active    string // scanner shown first
+	Job       *Job
+	Scanners  []formView
+	HasOutbox bool
+}
+
+// formView is the scan form of one scanner.
+type formView struct {
+	ID, Name string
+	Kind     scanner.Kind
+	Fields   []scanner.Field
 }
 
 func (s *Server) loadSession(w http.ResponseWriter, r *http.Request) (session.Manifest, bool) {
@@ -365,16 +399,18 @@ func (s *Server) sessionPage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	v := sessionView{M: m, HasScanSnap: s.d.ScanSnap != nil, HasEpson: s.d.Epson != nil, HasOutbox: s.d.Outbox != nil}
-	switch sc := r.URL.Query().Get("scanner"); {
-	case sc == "epson" && v.HasEpson, !v.HasScanSnap && v.HasEpson:
-		v.DefaultScanner = "epson"
-	default:
-		v.DefaultScanner = "scansnap"
+	v := sessionView{M: m, HasOutbox: s.d.Outbox != nil}
+	for _, d := range s.d.Scanners {
+		v.Scanners = append(v.Scanners, formView{ID: d.ID(), Name: d.Name(), Kind: d.Kind(), Fields: d.Form()})
 	}
-	v.SS.Color, v.SS.DPI, v.SS.Paper = config.ScanSnapProfileStrings(s.cfg.ScanSnap)
-	v.SS.Duplex, v.SS.Blank = s.cfg.ScanSnap.Duplex, s.cfg.ScanSnap.BlankPageRemoval
-	v.EP.Color, v.EP.DPI, v.EP.Region = config.EpsonProfileStrings(s.cfg.Epson)
+	if sc := r.URL.Query().Get("scanner"); sc != "" {
+		if _, ok := scanner.Find(s.d.Scanners, sc); ok {
+			v.Active = sc
+		}
+	}
+	if v.Active == "" && len(v.Scanners) > 0 {
+		v.Active = v.Scanners[0].ID
+	}
 	if j, ok := s.jobs.runningFor(m.ID); ok {
 		v.Job = &j
 	}
@@ -407,65 +443,32 @@ func (s *Server) startScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := m.ID
-	var (
-		job Job
-		err error
-	)
-	switch r.PostFormValue("scanner") {
-	case "scansnap":
-		if s.d.ScanSnap == nil {
-			s.fail(w, r, http.StatusBadRequest, "The ScanSnap is not configured.")
-			return
-		}
-		cfg, perr := config.ParseScanSnapProfile(r.PostFormValue("ss_color"), r.PostFormValue("ss_dpi"),
-			r.PostFormValue("ss_paper"), r.PostFormValue("ss_duplex") == "on", r.PostFormValue("ss_blank") == "on")
-		if perr != nil {
-			s.fail(w, r, http.StatusUnprocessableEntity, "Invalid ScanSnap settings.")
-			return
-		}
-		if st := s.d.ScanSnap.Status(); st.State != scansnap.StateClaimed {
-			s.fail(w, r, http.StatusConflict, scanSnapNotReady(st))
-			return
-		}
-		job, err = s.jobs.start("scansnap", id, func(ctx context.Context, added func()) error {
-			res := s.d.ScanSnap.Scan(ctx, scansnap.ScanRequest{Config: cfg, OnPage: func(p scansnap.Page) error {
-				if _, err := s.d.Store.AddPage(id, p.Data, "scansnap", p.Sheet, p.Side); err != nil {
-					return err
-				}
-				added()
-				return nil
-			}})
-			return friendlyScanError(res.Err)
-		})
-	case "epson":
-		if s.d.Epson == nil {
-			s.fail(w, r, http.StatusBadRequest, "The Epson is not configured.")
-			return
-		}
-		prof, perr := config.ParseEpsonProfile(r.PostFormValue("ep_color"), r.PostFormValue("ep_dpi"), r.PostFormValue("ep_region"))
-		if perr != nil {
-			s.fail(w, r, http.StatusUnprocessableEntity, "Invalid Epson settings.")
-			return
-		}
-		job, err = s.jobs.start("epson", id, func(ctx context.Context, added func()) error {
-			docs, err := s.d.Epson.Scan(ctx, EpsonSettings(prof))
-			if err != nil {
-				return friendlyScanError(err)
-			}
-			for _, d := range docs {
-				if _, err := s.d.Store.AddPage(id, d.Data, "epson", 0, 0); err != nil {
-					return err
-				}
-				added()
-			}
-			return nil
-		})
-	default:
+	dev, found := scanner.Find(s.d.Scanners, r.PostFormValue("scanner"))
+	if !found {
 		s.fail(w, r, http.StatusBadRequest, "Pick a scanner.")
 		return
 	}
+	settings, err := dev.ParseForm(r.PostFormValue)
+	if err != nil {
+		s.fail(w, r, http.StatusUnprocessableEntity, "Invalid settings for "+dev.Name()+".")
+		return
+	}
+	if err := dev.Ready(); err != nil {
+		s.fail(w, r, http.StatusConflict, err.Error())
+		return
+	}
+	job, err := s.jobs.start(dev.ID(), string(dev.Kind()), id, func(ctx context.Context, added func()) error {
+		err := dev.Scan(ctx, settings, func(p scanner.Page) error {
+			if _, err := s.d.Store.AddPage(id, p.Data, dev.ID(), p.Sheet, p.Side); err != nil {
+				return err
+			}
+			added()
+			return nil
+		})
+		return friendlyScanError(dev, err)
+	})
 	if errors.Is(err, errSessionBusy) {
-		s.fail(w, r, http.StatusConflict, "This session is being sent or discarded.")
+		s.fail(w, r, http.StatusConflict, "This session is busy: wait for its scan, send or discard to finish.")
 		return
 	}
 	if err != nil {
@@ -476,54 +479,23 @@ func (s *Server) startScan(w http.ResponseWriter, r *http.Request) {
 	s.fragment(w, http.StatusAccepted, "job", job)
 }
 
-// EpsonSettings maps a profile to eSCL settings.
-func EpsonSettings(p config.EpsonProfile) escl.ScanSettings {
-	st := escl.ScanSettings{ColorMode: p.ColorMode, DPI: p.DPI}
-	switch p.Region {
-	case "a4":
-		st.Region = escl.RegionA4
-	case "letter":
-		st.Region = escl.RegionLetter
-	}
-	return st
-}
-
-func scanSnapNotReady(st scansnap.Status) string {
-	switch st.State {
-	case scansnap.StateScanning:
-		return "The ScanSnap is already scanning."
-	case scansnap.StateHeldByOther:
-		if st.Holder != "" {
-			return "The ScanSnap is in use by " + st.Holder + "."
-		}
-		return "The ScanSnap is in use by another computer."
-	case scansnap.StateBadPassword:
-		return "The ScanSnap rejected the configured password."
-	default:
-		return "The ScanSnap is not connected yet (" + string(st.State) + ")."
-	}
-}
-
-func friendlyScanError(err error) error {
-	var se *vens.ScanError
+// friendlyScanError turns a scan error into a message for the job panel.
+func friendlyScanError(dev scanner.Device, err error) error {
 	switch {
 	case err == nil:
 		return nil
-	case errors.As(err, &se):
-		switch se.Kind {
-		case vens.ScanErrNoPaper:
-			return errors.New("No paper in the feeder.")
-		case vens.ScanErrPaperJam:
-			return errors.New("Paper jam: clear the feeder.")
-		case vens.ScanErrCoverOpen:
-			return errors.New("The feeder cover is open.")
-		case vens.ScanErrMultiFeed:
-			return errors.New("Several sheets fed at once: pages up to that point were kept.")
-		}
-	case errors.Is(err, scansnap.ErrBusy), errors.Is(err, escl.ErrBusy):
-		return errors.New("The scanner is busy.")
-	case errors.Is(err, scansnap.ErrNotReady):
-		return errors.New("The ScanSnap is not connected.")
+	case errors.Is(err, scanner.ErrNoPaper):
+		return errors.New("No paper in the feeder.")
+	case errors.Is(err, scanner.ErrJam):
+		return errors.New("Paper jam: clear the feeder.")
+	case errors.Is(err, scanner.ErrCoverOpen):
+		return errors.New("The feeder cover is open.")
+	case errors.Is(err, scanner.ErrMultiFeed):
+		return errors.New("Several sheets fed at once: pages up to that point were kept.")
+	case errors.Is(err, scanner.ErrBusy):
+		return errors.New(dev.Name() + " is busy.")
+	case errors.Is(err, scanner.ErrNotReady):
+		return errors.New(dev.Name() + " is not connected.")
 	case errors.Is(err, session.ErrLimit):
 		return errors.New("Session full: " + err.Error())
 	case errors.Is(err, context.Canceled):
@@ -733,13 +705,14 @@ func (s *Server) outboxPDF(w http.ResponseWriter, r *http.Request) {
 // readiness; scanning works during a Paperless outage).
 func (s *Server) statusJSON(w http.ResponseWriter, r *http.Request) {
 	v := s.status(r.Context())
-	out := map[string]any{}
-	if v.HasScanSnap {
-		out["scansnap"] = v.ScanSnap
+	scanners := map[string]any{}
+	for _, d := range v.Scanners {
+		scanners[d.ID] = map[string]any{
+			"name": d.Name, "kind": d.Kind, "state": d.Status.Label, "tone": d.Status.Tone,
+			"detail": d.Status.Detail, "device": d.Status.Raw,
+		}
 	}
-	if v.HasEpson {
-		out["epson"] = map[string]string{"state": v.Epson.State, "detail": v.Epson.Detail}
-	}
+	out := map[string]any{"scanners": scanners}
 	if v.HasPaperless {
 		out["paperless"] = map[string]any{"reachable": v.Paperless.Reachable, "detail": v.Paperless.Detail, "waiting": v.Waiting, "failed": v.Failed}
 	}
@@ -786,13 +759,6 @@ func (s *Server) parseTemplates() error {
 		"ago":   ago,
 		"inc":   func(i int) int { return i + 1 },
 		"stamp": stampClass,
-		"ssLabel": func(st scansnap.State) string {
-			return map[scansnap.State]string{
-				scansnap.StateClaimed: "Ready", scansnap.StateScanning: "Scanning", scansnap.StateConnecting: "Connecting",
-				scansnap.StateHeldByOther: "In use", scansnap.StateBadPassword: "Wrong password",
-				scansnap.StateNotConnected: "Offline", scansnap.StateStopping: "Stopping", scansnap.StateStopped: "Stopped",
-			}[st]
-		},
 		"stateLabel": func(st paperless.State) string {
 			return map[paperless.State]string{
 				paperless.StatePending: "Queued", paperless.StatePosting: "Uploading", paperless.StateUncertain: "Checking",
@@ -815,52 +781,30 @@ func (s *Server) parseTemplates() error {
 			}
 			return ""
 		},
-		"ssTone": func(st scansnap.State) string {
-			switch st {
-			case scansnap.StateClaimed:
-				return "ok"
-			case scansnap.StateScanning, scansnap.StateConnecting:
-				return "busy"
-			case scansnap.StateHeldByOther, scansnap.StateBadPassword:
-				return "bad"
-			}
-			return "idle"
-		},
-		"epTone": func(st string) string {
-			switch st {
-			case "Idle":
-				return "ok"
-			case "Processing", "Testing":
-				return "busy"
-			case "Unreachable", "Down", "Stopped":
-				return "bad"
-			}
-			return "idle"
-		},
-		"epLabel": func(st string) string {
-			if st == "Idle" {
-				return "Ready"
-			}
-			return st
-		},
 		"thumbH": func(w, h int) int {
 			if w <= 0 || h <= 0 {
 				return 509
 			}
 			return h * 360 / w
 		},
-		"scannerLabel": func(sc string) string {
-			return map[string]string{"scansnap": "ScanSnap", "epson": "Epson"}[sc]
+		"scannerLabel": s.scannerLabel,
+		"kindLabel": func(k scanner.Kind) string {
+			if k == scanner.Flatbed {
+				return "Glass"
+			}
+			return "Feeder"
 		},
+		"isFlatbed": func(k scanner.Kind) bool { return k == scanner.Flatbed },
+		"nameHead":  func(n string) string { h, _ := splitName(n); return h },
+		"nameTail":  func(n string) string { _, t := splitName(n); return t },
+		"bars":      func(n int) string { return strconv.Itoa(max(0, min(n, 3))) },
 		"docURL": func(id int) string {
 			if s.cfg.PaperlessURL == "" {
 				return ""
 			}
 			return fmt.Sprintf("%s/documents/%d/details", strings.TrimRight(s.cfg.PaperlessURL, "/"), id)
 		},
-		"sourceLabel": func(src string) string {
-			return map[string]string{"ui": "Desk", "scansnap-button": "ScanSnap button", "epson": "Epson", "recovered": "Recovered"}[src]
-		},
+		"sourceLabel": s.sourceLabel,
 	}
 	base := template.New("").Funcs(funcs)
 	base, err := base.ParseFS(templateFS, "templates/layout.html", "templates/fragments.html")
@@ -879,6 +823,41 @@ func (s *Server) parseTemplates() error {
 		s.pages[p] = t
 	}
 	return nil
+}
+
+// scannerLabel names the scanner a page came from: its display name, or the
+// raw id once that scanner is gone from the list.
+func (s *Server) scannerLabel(id string) string {
+	if d, ok := scanner.Find(s.d.Scanners, id); ok {
+		return d.Name()
+	}
+	if l, ok := map[string]string{"scansnap": "ScanSnap", "epson": "Epson"}[id]; ok {
+		return l // pages stored before the scanner list
+	}
+	return id
+}
+
+// sourceLabel describes how a session or outbox item started. Outbox items
+// keep it for weeks, so the labels of earlier releases stay.
+func (s *Server) sourceLabel(src string) string {
+	if id, ok := strings.CutPrefix(src, "button:"); ok {
+		return s.scannerLabel(id) + " button"
+	}
+	if id, ok := strings.CutPrefix(src, "cli:"); ok {
+		return s.scannerLabel(id) + " (command line)"
+	}
+	if l, ok := map[string]string{"ui": "Desk", "scansnap-button": "ScanSnap button", "epson": "Epson", "recovered": "Recovered"}[src]; ok {
+		return l
+	}
+	return src
+}
+
+// splitName sets the last word of a multi-word name apart (shown in italics).
+func splitName(n string) (head, tail string) {
+	if i := strings.LastIndexByte(n, ' '); i > 0 {
+		return n[:i], n[i+1:]
+	}
+	return n, ""
 }
 
 func stampClass(st paperless.State) string {
