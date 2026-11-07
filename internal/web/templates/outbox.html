@@ -1,0 +1,10 @@
+{{define "content"}}
+<section class="intro rise">
+  <p class="kicker">Outbox</p>
+  <h1>On its way to <em>Paperless</em></h1>
+  <p class="lede">Each document waits here until Paperless confirms it. Failed ones stay, with their PDF, until you retry or discard them.</p>
+</section>
+<section class="rise">
+{{template "outbox-list" .Content}}
+</section>
+{{end}}

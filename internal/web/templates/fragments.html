@@ -1,0 +1,171 @@
+{{define "flash"}}<div class="flash flash-{{.Kind}}" x-data="dismiss">
+  <p>{{.Msg}}</p>
+  <button type="button" class="flash-x" @click="close" aria-label="Dismiss">×</button>
+</div>{{end}}
+
+{{define "saved"}}<span class="saved-tick">Saved</span>{{end}}
+
+{{define "status"}}
+{{if .HasScanSnap}}
+<article class="card" data-tone="{{ssTone .ScanSnap.State}}">
+  <header class="card-head">
+    <span class="kicker">Feeder</span>
+    <h3>ScanSnap <em>iX500</em></h3>
+  </header>
+  <p class="stamp stamp-{{ssTone .ScanSnap.State}}">{{ssLabel .ScanSnap.State}}</p>
+  <dl class="facts">
+    <div><dt>Paper</dt><dd>{{if .ScanSnap.Paper}}Loaded{{else}}Empty{{end}}</dd></div>
+    <div><dt>Wi-Fi</dt><dd><span class="bars bars-{{.ScanSnap.WifiSignal}}" aria-label="signal {{.ScanSnap.WifiSignal}} of 3"><i></i><i></i><i></i></span></dd></div>
+    {{with .ScanSnap.Holder}}<div><dt>Held by</dt><dd>{{.}}</dd></div>{{end}}
+    {{with .ScanSnap.Firmware}}<div><dt>Firmware</dt><dd>{{.}}</dd></div>{{end}}
+  </dl>
+  {{with .ScanSnap.Detail}}<p class="card-note">{{.}}</p>{{end}}
+  <p class="card-hint">Press <kbd>Scan</kbd> on the scanner to {{if .HasPaperless}}file straight into Paperless{{else}}drop a batch on the desk{{end}}.</p>
+</article>
+{{end}}
+{{if .HasEpson}}
+<article class="card" data-tone="{{epTone .Epson.State}}">
+  <header class="card-head">
+    <span class="kicker">Glass</span>
+    <h3>Epson <em>ET-2750</em></h3>
+  </header>
+  <p class="stamp stamp-{{epTone .Epson.State}}">{{epLabel .Epson.State}}</p>
+  <dl class="facts">
+    <div><dt>Input</dt><dd>Flatbed, one page per pass</dd></div>
+  </dl>
+  {{with .Epson.Detail}}<p class="card-note">{{.}}</p>{{end}}
+</article>
+{{end}}
+{{if .HasPaperless}}
+<article class="card" data-tone="{{if .Paperless.Reachable}}ok{{else}}bad{{end}}">
+  <header class="card-head">
+    <span class="kicker">Archive</span>
+    <h3>Paperless <em>ngx</em></h3>
+  </header>
+  <p class="stamp stamp-{{if .Paperless.Reachable}}ok{{else}}bad{{end}}">{{if .Paperless.Reachable}}Online{{else}}Unreachable{{end}}</p>
+  <dl class="facts">
+    <div><dt>On its way</dt><dd>{{.Waiting}}</dd></div>
+    <div><dt>Failed</dt><dd>{{if .Failed}}<a href="/outbox">{{.Failed}}</a>{{else}}0{{end}}</dd></div>
+  </dl>
+  {{with .Paperless.Detail}}<p class="card-note">{{.}} (documents wait safely in the outbox)</p>{{end}}
+</article>
+{{end}}
+{{end}}
+
+{{define "job"}}<div class="job job-{{.State}}"{{if eq .State "running"}} hx-get="/jobs/{{.ID}}?seen={{.Pages}}" hx-trigger="every 1500ms" hx-swap="outerHTML"{{end}}>
+  {{if eq .State "running"}}
+  <div class="feed" aria-hidden="true"><i></i><i></i><i></i></div>
+  <p><strong>{{if eq .Scanner "epson"}}Scanning the glass…{{else}}Feeding sheets…{{end}}</strong> <span class="job-count">{{.Pages}} page{{if ne .Pages 1}}s{{end}} so far</span></p>
+  {{else if eq .State "done"}}
+  <p class="job-ok"><strong>✓ {{.Pages}} page{{if ne .Pages 1}}s{{end}} added.</strong>{{if eq .Scanner "epson"}} Turn the page and scan again for the next one.{{end}}</p>
+  {{else}}
+  <p class="job-bad"><strong>{{.Err}}</strong>{{if .Pages}} {{.Pages}} page{{if ne .Pages 1}}s were{{else}} was{{end}} kept.{{end}}</p>
+  {{end}}
+</div>{{end}}
+
+{{define "job-gone"}}<div class="job"><p>That scan finished a while ago.</p></div>{{end}}
+
+{{define "pages"}}
+<div class="sheets-head">
+  <h2 class="section-title">Pages <span class="count">{{len .M.Pages}}</span></h2>
+</div>
+{{if .M.Pages}}
+<ol class="sheets">
+  {{range $i, $p := .M.Pages}}
+  <li class="sheet">
+    <button type="button" class="sheet-img" @click="openLightbox" data-full="/sessions/{{$.M.ID}}/pages/{{$p.File}}/image" aria-label="View page {{inc $i}}">
+      {{if $p.Thumb}}<img src="/sessions/{{$.M.ID}}/pages/{{$p.File}}/thumb" alt="" loading="lazy" width="360" height="{{thumbH $p.Width $p.Height}}">{{else}}<span class="sheet-noimg">No preview</span>{{end}}
+    </button>
+    <span class="sheet-no">{{inc $i}}</span>
+    <span class="sheet-meta">{{scannerLabel $p.Scanner}}{{if $p.DPI}} · {{$p.DPI}} dpi{{end}}</span>
+    <span class="sheet-del-wrap" x-data="confirm">
+      <button type="button" class="sheet-del" x-show="idle" @click="arm" aria-label="Remove page {{inc $i}}">✕</button>
+      <button type="button" class="sheet-del sheet-del-armed" x-show="armed" x-cloak hx-delete="/sessions/{{$.M.ID}}/pages/{{$p.File}}" hx-target="#pages" aria-label="Confirm: remove page {{inc $i}}">Remove?</button>
+    </span>
+  </li>
+  {{end}}
+</ol>
+{{else}}
+<div class="empty">
+  <p class="empty-title">Nothing on the desk yet.</p>
+  <p>Load the feeder or lift the lid, then start a scan.</p>
+</div>
+{{end}}
+<div class="send-bar">
+  {{if .HasOutbox}}
+  <button type="button" class="stamp-btn" hx-post="/sessions/{{.M.ID}}/send" hx-disable="this"{{if not .M.Pages}} disabled{{end}}>
+    <span class="stamp-btn-label">Send to Paperless</span>
+    <span class="stamp-btn-sub">{{len .M.Pages}} page{{if ne (len .M.Pages) 1}}s{{end}} → one PDF</span>
+  </button>
+  {{else}}
+  <p class="muted">Paperless isn't configured: pages stay on this desk.</p>
+  {{end}}
+  {{if .M.Pages}}<a class="link-btn" href="/sessions/{{.M.ID}}/pdf" download>Download PDF</a>{{end}}
+  <span x-data="confirm">
+    <button type="button" class="link-btn danger" x-show="idle" @click="arm">Discard session</button>
+    <button type="button" class="link-btn danger armed" x-show="armed" x-cloak hx-delete="/sessions/{{.M.ID}}">Tap again to discard {{len .M.Pages}} page{{if ne (len .M.Pages) 1}}s{{end}}</button>
+  </span>
+</div>
+{{end}}
+
+{{define "outbox-list"}}<div id="outbox-list" class="ledger"{{if .Active}} hx-get="/fragments/outbox" hx-trigger="every 3s" hx-swap="outerHTML"{{end}}>
+{{if .Items}}
+<ol class="entries">
+  {{range .Items}}
+  <li class="entry entry-{{stamp .State}}">
+    <div class="entry-main">
+      <p class="entry-title">{{if .Title}}{{.Title}}{{else}}Untitled scan{{end}}</p>
+      <p class="entry-meta">{{.Pages}} p · {{bytes .Size}} · {{sourceLabel .Source}} · {{ago .Created}}</p>
+      {{with .Detail}}<p class="entry-detail">{{.}}</p>{{end}}
+    </div>
+    <p class="stamp stamp-{{stamp .State}}">{{stateLabel .State}}{{$doc := or .DocumentID .DuplicateOf}}{{if $doc}} {{with docURL $doc}}<a href="{{.}}" target="_blank" rel="noopener">#{{$doc}}</a>{{else}}#{{$doc}}{{end}}{{end}}</p>
+    {{if isFailure .State}}
+    <div class="entry-actions">
+      <a class="link-btn" href="/outbox/{{.ID}}/pdf" target="_blank" rel="noopener">View PDF</a>
+      <button type="button" class="link-btn" hx-post="/outbox/{{.ID}}/retry" hx-target="#outbox-list" hx-swap="outerHTML">Retry</button>
+      <span x-data="confirm">
+        <button type="button" class="link-btn danger" x-show="idle" @click="arm">Discard</button>
+        <button type="button" class="link-btn danger armed" x-show="armed" x-cloak hx-post="/outbox/{{.ID}}/discard" hx-target="#outbox-list" hx-swap="outerHTML">Delete PDF for good?</button>
+      </span>
+    </div>
+    {{end}}
+  </li>
+  {{end}}
+</ol>
+{{else}}
+<div class="empty"><p class="empty-title">The outbox is empty.</p><p>Sent documents appear here until Paperless has filed them.</p></div>
+{{end}}
+</div>{{end}}
+
+{{define "desk"}}
+{{with .Sessions}}
+<section aria-labelledby="open-title">
+  <h2 id="open-title" class="section-title">On the desk <span class="count">{{len .}}</span></h2>
+  <ul class="sessions">
+    {{range .}}
+    <li><a href="/sessions/{{.ID}}">
+      <span class="s-title">{{if .Title}}{{.Title}}{{else}}Untitled <em>№ {{short .ID}}</em>{{end}}</span>
+      <span class="s-meta">{{len .Pages}} page{{if ne (len .Pages) 1}}s{{end}} · {{sourceLabel .Source}} · {{ago .Updated}}</span>
+    </a></li>
+    {{end}}
+  </ul>
+</section>
+{{end}}
+
+{{with .Recent}}
+<section aria-labelledby="recent-title">
+  <h2 id="recent-title" class="section-title">Recently sent <a class="more" href="/outbox">Outbox →</a></h2>
+  <ol class="entries entries-compact">
+    {{range .}}
+    <li class="entry entry-{{stamp .State}}">
+      <div class="entry-main">
+        <p class="entry-title">{{if .Title}}{{.Title}}{{else}}Untitled scan{{end}}</p>
+        <p class="entry-meta">{{.Pages}} p · {{sourceLabel .Source}} · {{ago .Created}}</p>
+      </div>
+      <p class="stamp stamp-{{stamp .State}}">{{stateLabel .State}}</p>
+    </li>
+    {{end}}
+  </ol>
+</section>
+{{end}}
+{{end}}

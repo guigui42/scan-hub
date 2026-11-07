@@ -1,0 +1,64 @@
+# scan-hub — example Compose service. Linux Docker only: host networking is required so the ScanSnap can
+# reach UDP 55264/55265 (discovery replies, Scan-button events) and the 0.5 s
+# heartbeat works. Docker Desktop's host networking is not supported.
+#
+# Local test with the gitignored .env (values are interpolated, not passed
+# wholesale):
+#   docker build -t scan-hub:dev .
+#   SCANHUB_IMAGE=scan-hub:dev docker compose --env-file .env -f compose.example.yaml up
+#
+# All configuration is environment variables; see README.md for the full table.
+
+services:
+  scan-hub:
+    image: ${SCANHUB_IMAGE:-ghcr.io/guigui42/scan-hub:0.1.0}
+    container_name: scan-hub
+    network_mode: host
+    init: true
+    restart: unless-stopped
+    # Leaves time to finish or abort a scan and RELEASE the ScanSnap.
+    stop_grace_period: 30s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp
+    volumes:
+      - scan-hub-data:/data
+      # If the host's /etc/resolv.conf is not world-readable, the non-root
+      # user can't resolve host names (e.g. a Paperless URL). Mount a readable
+      # copy:
+      # - /path/to/resolv.conf:/etc/resolv.conf:ro
+    environment:
+      # Explicit LAN IPv4, never a wildcard (the UI has no login).
+      SCANHUB_LISTEN_ADDR: ${SCANHUB_LISTEN_ADDR:?set SCANHUB_LISTEN_ADDR, e.g. 192.168.1.10:8097}
+      # Host names the UI answers to behind the reverse proxy.
+      SCANHUB_ALLOWED_HOSTS: ${SCANHUB_ALLOWED_HOSTS:-}
+      SCANHUB_LOG_LEVEL: ${SCANHUB_LOG_LEVEL:-info}
+
+      SCANHUB_SCANSNAP_IP: ${SCANHUB_SCANSNAP_IP:-}
+      SCANHUB_SCANSNAP_PASSWORD: ${SCANHUB_SCANSNAP_PASSWORD:-}
+      SCANHUB_BUTTON_COLOR: ${SCANHUB_BUTTON_COLOR:-auto}
+      SCANHUB_BUTTON_DPI: ${SCANHUB_BUTTON_DPI:-300}
+      SCANHUB_BUTTON_DUPLEX: ${SCANHUB_BUTTON_DUPLEX:-true}
+      SCANHUB_BUTTON_PAPER: ${SCANHUB_BUTTON_PAPER:-auto}
+      SCANHUB_BUTTON_BLANK_PAGE_REMOVAL: ${SCANHUB_BUTTON_BLANK_PAGE_REMOVAL:-true}
+
+      SCANHUB_EPSON_URL: ${SCANHUB_EPSON_URL:-}
+      SCANHUB_EPSON_TLS_PIN: ${SCANHUB_EPSON_TLS_PIN:-}
+
+      SCANHUB_PAPERLESS_URL: ${SCANHUB_PAPERLESS_URL:-}
+      SCANHUB_PAPERLESS_TOKEN: ${SCANHUB_PAPERLESS_TOKEN:-}
+      SCANHUB_PAPERLESS_TAGS: ${SCANHUB_PAPERLESS_TAGS:-}
+
+      SCANHUB_SESSION_MAX_AGE: ${SCANHUB_SESSION_MAX_AGE:-24h}
+      SCANHUB_OUTBOX_MAX_MB: ${SCANHUB_OUTBOX_MAX_MB:-2048}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/scan-hub", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  scan-hub-data:

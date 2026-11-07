@@ -1,0 +1,10 @@
+# Build context: only what the image needs.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/
+!LICENSE
+!THIRD_PARTY_NOTICES
+**/*_test.go
+cmd/scan-hub-demo/

@@ -1,0 +1,14 @@
+{
+  "name": "scan-hub-e2e",
+  "private": true,
+  "description": "Browser smoke tests for the scan-hub UI against fake devices (cmd/scan-hub-demo).",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.0"
+  }
+}

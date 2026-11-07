@@ -1,0 +1,90 @@
+{{define "content"}}{{with .Content}}
+<div class="session" x-data="sessionPage" data-scanner="{{.DefaultScanner}}">
+  <section class="session-head rise">
+    <a class="back" href="/">← Desk</a>
+    <p class="kicker">Session № {{short .M.ID}} · started {{ago .M.Created}}</p>
+    <form class="title-form" hx-post="/sessions/{{.M.ID}}/title" hx-trigger="change, submit" hx-target="find .title-state">
+      <label class="visually-hidden" for="title">Document title</label>
+      <input id="title" name="title" value="{{.M.Title}}" maxlength="200" autocomplete="off" placeholder="Untitled — Paperless will name it">
+      <span class="title-state" aria-live="polite"></span>
+    </form>
+  </section>
+
+  <section class="scan-panel rise" aria-labelledby="scan-title">
+    <h2 id="scan-title" class="visually-hidden">Scan</h2>
+    {{if and .HasScanSnap .HasEpson}}
+    <div class="switch" role="group" aria-label="Scanner">
+      <button type="button" class="switch-opt" @click="useScanSnap" :aria-pressed="ssPressed">Feeder <small>ScanSnap</small></button>
+      <button type="button" class="switch-opt" @click="useEpson" :aria-pressed="epPressed">Glass <small>Epson</small></button>
+    </div>
+    {{end}}
+    <form class="scan-form" hx-post="/sessions/{{.M.ID}}/scan" hx-target="#job" hx-disable="find button[type=submit]">
+      <input type="hidden" name="scanner" :value="scanner" value="{{.DefaultScanner}}">
+      {{if .HasScanSnap}}
+      <fieldset class="profile" x-show="isScanSnap">
+        <legend class="visually-hidden">ScanSnap settings</legend>
+        <label>Colour
+          <select name="ss_color">
+            <option value="auto" {{sel .SS.Color "auto"}}>Auto</option>
+            <option value="color" {{sel .SS.Color "color"}}>Colour</option>
+            <option value="gray" {{sel .SS.Color "gray"}}>Grey</option>
+            <option value="bw" {{sel .SS.Color "bw"}}>Black &amp; white</option>
+          </select></label>
+        <label>Resolution
+          <select name="ss_dpi">
+            <option value="auto" {{sel .SS.DPI "auto"}}>Auto</option>
+            <option value="150" {{sel .SS.DPI "150"}}>150 dpi</option>
+            <option value="200" {{sel .SS.DPI "200"}}>200 dpi</option>
+            <option value="300" {{sel .SS.DPI "300"}}>300 dpi</option>
+          </select></label>
+        <label>Paper
+          <select name="ss_paper">
+            <option value="auto" {{sel .SS.Paper "auto"}}>Auto-detect</option>
+            <option value="a4" {{sel .SS.Paper "a4"}}>A4</option>
+            <option value="a5" {{sel .SS.Paper "a5"}}>A5</option>
+            <option value="business-card" {{sel .SS.Paper "business-card"}}>Business card</option>
+            <option value="postcard" {{sel .SS.Paper "postcard"}}>Postcard</option>
+          </select></label>
+        <label class="check"><input type="checkbox" name="ss_duplex" {{checked .SS.Duplex}}> Both sides</label>
+        <label class="check"><input type="checkbox" name="ss_blank" {{checked .SS.Blank}}> Skip blank pages</label>
+      </fieldset>
+      {{end}}
+      {{if .HasEpson}}
+      <fieldset class="profile" x-show="isEpson"{{if .HasScanSnap}} x-cloak{{end}}>
+        <legend class="visually-hidden">Epson settings</legend>
+        <label>Colour
+          <select name="ep_color">
+            <option value="color" {{sel .EP.Color "color"}}>Colour</option>
+            <option value="gray" {{sel .EP.Color "gray"}}>Grey</option>
+            <option value="bw" {{sel .EP.Color "bw"}}>Black &amp; white</option>
+          </select></label>
+        <label>Resolution
+          <select name="ep_dpi">
+            <option value="100" {{sel .EP.DPI "100"}}>100 dpi</option>
+            <option value="200" {{sel .EP.DPI "200"}}>200 dpi</option>
+            <option value="300" {{sel .EP.DPI "300"}}>300 dpi</option>
+            <option value="600" {{sel .EP.DPI "600"}}>600 dpi</option>
+          </select></label>
+        <label>Area
+          <select name="ep_region">
+            <option value="a4" {{sel .EP.Region "a4"}}>A4</option>
+            <option value="letter" {{sel .EP.Region "letter"}}>Letter</option>
+            <option value="max" {{sel .EP.Region "max"}}>Whole glass</option>
+          </select></label>
+      </fieldset>
+      {{end}}
+      <button type="submit" class="btn-scan"><span class="btn-scan-dot" aria-hidden="true"></span><span x-show="isScanSnap">Feed the stack</span><span x-show="isEpson" x-cloak>Scan the glass</span></button>
+    </form>
+    <div id="job" class="job-zone">{{with .Job}}{{template "job" .}}{{end}}</div>
+  </section>
+
+  <section id="pages" class="rise" hx-get="/sessions/{{.M.ID}}/pages" hx-trigger="pages-changed from:body">
+    {{template "pages" .}}
+  </section>
+
+  <div class="lightbox" x-show="lightbox" x-cloak @click="closeLightbox" @keydown.escape.window="closeLightbox" role="dialog" aria-label="Page preview">
+    <img :src="lightboxSrc" alt="">
+    <button type="button" class="lightbox-x" aria-label="Close">×</button>
+  </div>
+</div>
+{{end}}{{end}}

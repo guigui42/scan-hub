@@ -1,0 +1,21 @@
+# Binaries
+/scan-hub
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Local runtime data and secrets
+/data/
+.env
+*.env
+!*.env.example
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Private maintainer instructions
+/.github/instructions/local.instructions.md

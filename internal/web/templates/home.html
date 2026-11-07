@@ -1,0 +1,35 @@
+{{define "content"}}
+<section class="intro rise">
+  <p class="kicker">The desk</p>
+  <h1>What are we <em>filing</em> today?</h1>
+</section>
+
+<section class="start rise" aria-labelledby="start-title">
+  <h2 id="start-title" class="section-title">Start a session</h2>
+  <p class="lede">Collect pages, check them, then send them to Paperless as one PDF.</p>
+  <div class="tickets">
+    {{if .Status.HasScanSnap}}
+    <button type="button" class="ticket" hx-post="/sessions" hx-vals='{"scanner":"scansnap"}' hx-disable="this">
+      <span class="ticket-kicker">Feeder</span>
+      <span class="ticket-title">A stack of sheets</span>
+      <span class="ticket-sub">ScanSnap · duplex · batch</span>
+    </button>
+    {{end}}
+    {{if .Status.HasEpson}}
+    <button type="button" class="ticket ticket-alt" hx-post="/sessions" hx-vals='{"scanner":"epson"}' hx-disable="this">
+      <span class="ticket-kicker">Glass</span>
+      <span class="ticket-title">Booklets &amp; fragile pages</span>
+      <span class="ticket-sub">Epson · one page per pass</span>
+    </button>
+    {{end}}
+  </div>
+</section>
+
+<section id="status" class="cards rise" hx-get="/fragments/status" hx-trigger="every 5s" aria-label="Devices">
+{{template "status" .Status}}
+</section>
+
+<div id="desk-lists" class="desk-lists" hx-get="/fragments/desk" hx-trigger="every 5s" hx-swap="innerMorph">
+{{template "desk" .Content}}
+</div>
+{{end}}
