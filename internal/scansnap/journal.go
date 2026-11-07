@@ -107,6 +107,13 @@ func (j journal) write(st journalState) error {
 	return fsutil.WriteFileAtomic(j.path, b, 0o600)
 }
 
+func removeDurable(path string) error {
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return fsutil.SyncDir(filepath.Dir(path))
+}
+
 // JournalPath is where the ownership journal of the ScanSnap with id lives
 // under dir (the data directory's scansnap folder).
 func JournalPath(dir, id string) string { return filepath.Join(dir, id, "journal.json") }
@@ -125,25 +132,34 @@ func PrepareJournals(dir string, scanners map[string]string) error {
 	if _, err := os.Stat(legacy); err == nil {
 		st, lerr := journal{path: legacy}.load()
 		switch {
+		case len(scanners) > 0 && lerr != nil:
+			errs = append(errs, fmt.Errorf("%w (fix or delete it)", lerr))
 		case len(scanners) == 1:
-			for id := range scanners {
+			for id, ip := range scanners {
 				target := JournalPath(dir, id)
 				if _, err := os.Stat(target); err == nil {
 					errs = append(errs, fmt.Errorf("both %s and %s exist: remove the stale one", legacy, target))
 					break
 				}
-				if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+				// Bind it to the scanner now, so a failed start followed by an
+				// IP change can't reuse its token on another scanner.
+				st.ScannerIP = ip
+				if err := (journal{path: target}).write(st); err != nil {
 					errs = append(errs, err)
 					break
 				}
-				if err := os.Rename(legacy, target); err != nil {
+				if err := removeDurable(legacy); err != nil {
 					errs = append(errs, err)
 				}
 			}
-		case len(scanners) > 1 && lerr != nil:
-			errs = append(errs, fmt.Errorf("%w (with several ScanSnaps it cannot be assigned: fix or delete it)", lerr))
 		case len(scanners) > 1 && st.Dirty:
 			errs = append(errs, fmt.Errorf("%s records an unreleased session but several ScanSnaps are configured: start once with only the ScanSnap it belongs to", legacy))
+		case len(scanners) > 1:
+			// Clean: nothing to recover. Drop it so a later move back to one
+			// ScanSnap doesn't find two journals.
+			if err := removeDurable(legacy); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		errs = append(errs, err)

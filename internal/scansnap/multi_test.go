@@ -284,8 +284,12 @@ func TestPrepareJournals(t *testing.T) {
 			t.Fatal(err)
 		}
 		st, err := journal{path: JournalPath(dir, "feeder")}.load()
-		if err != nil || !st.Dirty || st.Token != dirty.Token {
+		if err != nil || !st.Dirty || st.Token != dirty.Token || st.ScannerIP != "192.168.1.50" {
 			t.Fatalf("migrated %+v, %v", st, err)
+		}
+		// Bound to its scanner: a changed IP can no longer adopt its token.
+		if err := PrepareJournals(dir, map[string]string{"feeder": "192.168.1.99"}); err == nil {
+			t.Fatal("migrated dirty journal accepted for another IP")
 		}
 		if _, err := os.Stat(filepath.Join(dir, "journal.json")); !errors.Is(err, os.ErrNotExist) {
 			t.Fatal("legacy journal left behind")
@@ -311,6 +315,23 @@ func TestPrepareJournals(t *testing.T) {
 		writeJournal(t, filepath.Join(dir, "journal.json"), clean)
 		if err := PrepareJournals(dir, two); err != nil {
 			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "journal.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("clean legacy journal kept")
+		}
+		// The managers then write their own journals; going back to one
+		// ScanSnap must still start.
+		writeJournal(t, JournalPath(dir, "feeder"), clean)
+		writeJournal(t, JournalPath(dir, "other"), clean)
+		if err := PrepareJournals(dir, one); err != nil {
+			t.Fatal("two-to-one ScanSnaps:", err)
+		}
+	})
+	t.Run("malformed legacy with one ScanSnap", func(t *testing.T) {
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "journal.json"), []byte("{"), 0o600)
+		if err := PrepareJournals(dir, one); err == nil {
+			t.Fatal("want an error")
 		}
 	})
 	t.Run("malformed legacy with several ScanSnaps", func(t *testing.T) {

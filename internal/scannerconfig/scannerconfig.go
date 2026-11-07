@@ -64,6 +64,11 @@ func Parse(b []byte, drivers map[string]Driver) ([]scanner.Device, error) {
 	dec.KnownFields(true)
 	if err := dec.Decode(&doc); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("scanner list: %w", err)
+	} else if err == nil {
+		var extra yaml.Node
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			return nil, errors.New("scanner list: want a single YAML document (found a second one after ---)")
+		}
 	}
 	var (
 		devs []scanner.Device

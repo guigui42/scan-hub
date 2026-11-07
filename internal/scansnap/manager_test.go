@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -459,5 +460,43 @@ func TestReleaseRefusedWhileScanning(t *testing.T) {
 	<-done
 	if err := r.m.Release(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTakeBackWhileClaimedIsANoop(t *testing.T) {
+	f := startFake(t, venstest.Options{})
+	r := run(t, testConfig(t, f, filepath.Join(t.TempDir(), "j.json")))
+	waitState(t, r.m, StateClaimed)
+	reserves := f.Stats().Reserves
+	if err := r.m.TakeBack(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if st := r.m.Status().State; st != StateClaimed || f.Stats().Reserves != reserves {
+		t.Fatalf("take back while claimed reclaimed: state %s, reserves %d -> %d", st, reserves, f.Stats().Reserves)
+	}
+}
+
+func TestReleaseRetriesRememberingIt(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	f := startFake(t, venstest.Options{})
+	dir := t.TempDir()
+	jp := filepath.Join(dir, "j.json")
+	r := run(t, testConfig(t, f, jp))
+	waitState(t, r.m, StateClaimed)
+
+	os.Chmod(dir, 0o500) // journal writes fail
+	err := r.m.Release(context.Background())
+	os.Chmod(dir, 0o700)
+	if err == nil || r.m.Status().State != StateReleased {
+		t.Fatalf("want a released scanner and a write error, got %v / %s", err, r.m.Status().State)
+	}
+	if err := r.m.Release(context.Background()); err != nil {
+		t.Fatal("retry:", err)
+	}
+	if js, _ := (journal{path: jp}).load(); !js.Released {
+		t.Fatalf("retry did not remember the release: %+v", js)
 	}
 }

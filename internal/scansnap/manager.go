@@ -298,9 +298,9 @@ func (m *Manager) Run(ctx context.Context) error {
 				req.resp <- m.release(ctx)
 				retry = nil
 			} else {
-				err := m.takeBack()
+				changed, err := m.takeBack()
 				req.resp <- err
-				if err == nil {
+				if changed {
 					m.backoff = m.cfg.RetryMin
 					retry = time.After(0)
 				}
@@ -632,7 +632,9 @@ func (m *Manager) request(ctx context.Context, release bool) error {
 // release runs on the actor.
 func (m *Manager) release(ctx context.Context) error {
 	if m.released {
-		return nil
+		// Already off the scanner; make sure a restart remembers it (an
+		// earlier write may have failed).
+		return m.jr.setReleased(true)
 	}
 	if m.claimed {
 		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
@@ -657,18 +659,18 @@ func (m *Manager) release(ctx context.Context) error {
 	return nil
 }
 
-// takeBack runs on the actor.
-func (m *Manager) takeBack() error {
+// takeBack runs on the actor; changed reports that a claim should start.
+func (m *Manager) takeBack() (changed bool, err error) {
 	if !m.released {
-		return nil
+		return false, nil
 	}
 	if err := m.jr.setReleased(false); err != nil {
-		return err
+		return false, err
 	}
 	m.released = false
 	m.setState(StateConnecting, "")
 	m.log.Info("taking the scanner back")
-	return nil
+	return true, nil
 }
 
 // shutdown releases with its own bounded context (Run's ctx is already

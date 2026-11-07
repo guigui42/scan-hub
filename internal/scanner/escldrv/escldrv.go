@@ -30,6 +30,17 @@ type Profile struct {
 // DefaultProfile is used for keys missing from the scanner list.
 var DefaultProfile = Profile{Color: "color", DPI: "300", Region: "a4"}
 
+// canonical returns the profile with the form's option values (e.g. "grey"
+// becomes "gray"), so a valid default preselects its option.
+func (p Profile) canonical() Profile {
+	c := map[string]string{"colour": "color", "grey": "gray"}
+	p.Color, p.Region = strings.ToLower(p.Color), strings.ToLower(p.Region)
+	if v, ok := c[p.Color]; ok {
+		p.Color = v
+	}
+	return p
+}
+
 // Settings converts a profile to eSCL settings.
 func (p Profile) Settings() (escl.ScanSettings, error) {
 	var (
@@ -130,7 +141,7 @@ func (d *Driver) Build(c scannerconfig.Common, decode func(any) error) (scanner.
 	if err != nil {
 		return nil, err
 	}
-	return NewDevice(c.ID, c.Name, cl, p, d.opts.StatusTTL), nil
+	return NewDevice(c.ID, c.Name, cl, p.canonical(), d.opts.StatusTTL), nil
 }
 
 // Device is one eSCL scanner.

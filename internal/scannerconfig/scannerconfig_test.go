@@ -261,3 +261,30 @@ func TestExampleFileIsValid(t *testing.T) {
 		t.Fatalf("%d devices, %v", len(devs), err)
 	}
 }
+
+func TestOnlyOneYAMLDocument(t *testing.T) {
+	for _, y := range []string{
+		"---\n---\nscanners:\n  - id: g\n    type: escl\n    url: http://192.168.1.60\n",
+		"scanners: []\n---\nfoo: 1\n",
+	} {
+		_, err := parse(t, y, nil)
+		wantErr(t, err, "single YAML document")
+	}
+}
+
+func TestESCLDefaultsUseFormValues(t *testing.T) {
+	devs, err := parse(t, "scanners:\n  - id: g\n    type: escl\n    url: http://192.168.1.60\n    defaults: {color: Grey, region: MAX}\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range devs[0].Form() {
+		want := map[string]string{"color": "gray", "region": "max", "dpi": "300"}[f.Name]
+		found := false
+		for _, o := range f.Options {
+			found = found || o.Value == f.Value
+		}
+		if f.Value != want || !found {
+			t.Fatalf("field %s: value %q (want %q), matches an option: %v", f.Name, f.Value, want, found)
+		}
+	}
+}

@@ -150,7 +150,16 @@ test('a ScanSnap can be released and taken back from its card', async ({ page })
   await page.goto('/')
   const card = page.locator('#status .card[data-scanner="feeder"]')
   await expect(card.locator('.stamp')).toHaveText('Ready', { timeout: 15_000 })
+  // The cards poll every 5 s and the confirmation stays armed for 4 s: arm it
+  // 2 s after a poll so the next poll falls inside that window.
+  await page.waitForResponse((r) => r.url().endsWith('/fragments/status'))
+  await page.waitForTimeout(2000)
   await card.getByRole('button', { name: 'Release' }).click()
+  let polls = 0
+  page.on('request', (r) => { if (r.url().endsWith('/fragments/status')) polls++ })
+  await page.waitForTimeout(3800)
+  await expect(card.getByRole('button', { name: 'Tap again to release' })).toBeVisible()
+  expect(polls).toBe(0)
   await card.getByRole('button', { name: 'Tap again to release' }).click()
   await expect(card.locator('.stamp')).toHaveText('Released')
   await expect(card).toContainText('other computers can use it')

@@ -3,14 +3,20 @@
 document.addEventListener('alpine:init', () => {
   // Tap-twice confirmation: native confirm() is unreliable in embedded and
   // mobile browsers. The first tap arms the real button for 4 s.
+  // While armed it carries data-armed, so polling doesn't replace it (see
+  // below).
   Alpine.data('confirm', () => ({
     armed: false,
     timer: null,
     get idle() { return !this.armed },
     arm() {
       this.armed = true
+      this.$root.dataset.armed = ''
       clearTimeout(this.timer)
-      this.timer = setTimeout(() => { this.armed = false }, 4000)
+      this.timer = setTimeout(() => {
+        this.armed = false
+        delete this.$root.dataset.armed
+      }, 4000)
     },
   }))
 
@@ -44,4 +50,14 @@ document.addEventListener('alpine:init', () => {
     get pressed() { return this.shown ? 'true' : 'false' },
     pick() { this.scanner = this.$root.dataset.scanner },
   }))
+})
+
+// A polling region (e.g. the device cards) skips its refresh while it holds
+// an armed confirmation, which the swap would otherwise reset between taps.
+// The armed button's own request still goes through.
+document.addEventListener('htmx:before:request', (e) => {
+  const el = e.target
+  if (!el.getAttribute || !/\bevery\b/.test(el.getAttribute('hx-trigger') || '')) return
+  const armed = el.querySelector('[data-armed]')
+  if (armed && !armed.contains(el)) e.preventDefault()
 })
