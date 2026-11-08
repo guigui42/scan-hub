@@ -12,7 +12,7 @@
 
 services:
   scan-hub:
-    image: ${SCANHUB_IMAGE:-ghcr.io/guigui42/scan-hub:0.1.0}
+    image: ${SCANHUB_IMAGE:-ghcr.io/guigui42/scan-hub:0.2.0}
     container_name: scan-hub
     network_mode: host
     init: true
