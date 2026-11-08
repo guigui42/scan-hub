@@ -191,10 +191,10 @@ func TestScanSnapValidation(t *testing.T) {
 	for y, want := range map[string]string{
 		"ip: scanner.example.com\n    password_env: PW": "ip: want an IPv4",
 		"ip: 192.168.1.50":                                                  "password_file or password_env is required",
-		"ip: 192.168.1.50\n    password_env: NOPE":                          "NOPE is not set",
-		"ip: 192.168.1.50\n    password_env: EMPTY":                         "EMPTY is not set",
+		"ip: 192.168.1.50\n    password_env: NOPE":                          "password_env: the variable is not set",
+		"ip: 192.168.1.50\n    password_env: EMPTY":                         "password_env: the variable is not set",
 		"ip: 192.168.1.50\n    password_file: pw.txt":                       "absolute path",
-		"ip: 192.168.1.50\n    password_file: /nonexistent/pw":              "password_file",
+		"ip: 192.168.1.50\n    password_file: /nonexistent/pw":              "password_file: no such file",
 		"ip: 192.168.1.50\n    password_env: PW\n    password_file: /x":     "only one of",
 		"ip: 192.168.1.50\n    password_env: PW\n    defaults: {paper: a3}": "paper: want",
 	} {
@@ -220,6 +220,13 @@ func TestSecretNeverInErrors(t *testing.T) {
 	_, err := parse(t, "scanners:\n  - id: s\n    type: scansnap\n    ip: 192.168.1.50\n    password_file: "+pw+"\n", nil)
 	if err == nil || strings.Contains(err.Error(), "s3cr3t") {
 		t.Fatalf("got %v", err)
+	}
+	// A password pasted where a variable name or path belongs stays out too.
+	for _, y := range []string{"password_env: s3cr3t", "password_file: s3cr3t", "password_file: /s3cr3t"} {
+		_, err := parse(t, "scanners:\n  - id: s\n    type: scansnap\n    ip: 192.168.1.50\n    "+y+"\n", nil)
+		if err == nil || strings.Contains(err.Error(), "s3cr3t") {
+			t.Fatalf("%s: got %v", y, err)
+		}
 	}
 }
 

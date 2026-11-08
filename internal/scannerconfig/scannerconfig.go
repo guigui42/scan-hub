@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -138,26 +139,32 @@ func typeList(drivers map[string]Driver) string {
 // Secret reads a secret from exactly one of a file (absolute path) or an
 // environment variable; neither may be empty.
 func Secret(lookup func(string) (string, bool), file, env string) (string, error) {
+	// Errors never echo file or env: a misconfigured entry may hold the
+	// password itself instead of a path or variable name.
 	switch {
 	case file != "" && env != "":
 		return "", errors.New("set only one of password_file and password_env")
 	case file != "":
 		if !filepath.IsAbs(file) {
-			return "", fmt.Errorf("password_file must be an absolute path, got %q", file)
+			return "", errors.New("password_file must be an absolute path")
 		}
 		b, err := os.ReadFile(file)
 		if err != nil {
+			var pe *fs.PathError
+			if errors.As(err, &pe) {
+				err = pe.Err
+			}
 			return "", fmt.Errorf("password_file: %w", err)
 		}
 		if v := strings.TrimSpace(string(b)); v != "" {
 			return v, nil
 		}
-		return "", fmt.Errorf("password_file %s is empty", file)
+		return "", errors.New("password_file is empty")
 	case env != "":
 		if v, ok := lookup(env); ok && strings.TrimSpace(v) != "" {
 			return strings.TrimSpace(v), nil
 		}
-		return "", fmt.Errorf("password_env: %s is not set", env)
+		return "", errors.New("password_env: the variable is not set or empty")
 	}
 	return "", errors.New("password_file or password_env is required")
 }
