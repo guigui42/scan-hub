@@ -5,13 +5,13 @@ package scansnap
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
+	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/guigui42/scan-hub/internal/vens"
@@ -29,6 +29,9 @@ const (
 	StateStopping     State = "stopping"
 	StateStopped      State = "stopped"
 	StateNotConnected State = "not-connected"
+	// StateReleased: released on request so another computer can use the
+	// scanner; scan-hub doesn't claim it until TakeBack.
+	StateReleased State = "released"
 )
 
 var (
@@ -48,7 +51,11 @@ type Config struct {
 	DataPort           int // scanner TCP, default 53218
 	DiscoveryPort      int // scanner UDP, default 52217
 	DiscoveryReplyPort int // local UDP, default 55264
-	NotifyPort         int // local UDP for button events, default 55265
+	NotifyPort         int // local UDP for button events, default 55265 (ignored with Hub)
+
+	// Hub shares the button-event port with other managers. Nil gives the
+	// manager a private listener on NotifyPort.
+	Hub *NotifyHub
 
 	HeartbeatInterval time.Duration // default 500 ms
 	StatusInterval    time.Duration // liveness poll while idle, default 10 s
@@ -57,6 +64,7 @@ type Config struct {
 	BadPasswordRetry  time.Duration // default 5 min
 	ScanGrace         time.Duration // on shutdown, time a running scan may finish; default 20 s
 	ButtonDebounce    time.Duration // same counter within this window is a repeat; default 5 s
+	AnnounceDebounce  time.Duration // power-on announcements within this window count once; default 10 s
 
 	Logger *slog.Logger
 }
@@ -76,7 +84,9 @@ func (c *Config) defaults() {
 	def(&c.DataPort, vens.DefaultDataPort)
 	def(&c.DiscoveryPort, vens.DiscoveryPort)
 	def(&c.DiscoveryReplyPort, vens.ClientDiscoveryPort)
-	def(&c.NotifyPort, vens.ClientNotifyPort)
+	if c.Hub == nil {
+		def(&c.NotifyPort, vens.ClientNotifyPort)
+	}
 	defd(&c.HeartbeatInterval, 500*time.Millisecond)
 	defd(&c.StatusInterval, 10*time.Second)
 	defd(&c.RetryMin, 2*time.Second)
@@ -84,6 +94,7 @@ func (c *Config) defaults() {
 	defd(&c.BadPasswordRetry, 5*time.Minute)
 	defd(&c.ScanGrace, 20*time.Second)
 	defd(&c.ButtonDebounce, 5*time.Second)
+	defd(&c.AnnounceDebounce, 10*time.Second)
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
@@ -145,9 +156,12 @@ type Manager struct {
 	jr      journal
 	jobs    chan scanJob
 	buttons chan ButtonEvent
+	wake    chan struct{} // the scanner announced it just started
+	ctl     chan ctlReq   // release / take back
 
 	mu     sync.RWMutex
 	status Status
+	ran    atomic.Bool
 
 	// Actor-owned state (only touched by Run's goroutine).
 	token       [8]byte
@@ -158,6 +172,14 @@ type Manager struct {
 	dataPort    int
 	pollFails   int
 	backoff     time.Duration
+	notifyPort  int
+	lastWake    time.Time
+	released    bool
+}
+
+type ctlReq struct {
+	release bool
+	resp    chan error
 }
 
 // New returns a Manager; nothing touches the network until Run.
@@ -165,10 +187,12 @@ func New(cfg Config) *Manager {
 	cfg.defaults()
 	m := &Manager{
 		cfg:         cfg,
-		log:         cfg.Logger.With("component", "scansnap", "scanner", cfg.ScannerIP),
-		jr:          journal{path: cfg.JournalPath},
+		log:         cfg.Logger.With("component", "scansnap", "ip", cfg.ScannerIP),
+		jr:          journal{path: cfg.JournalPath, ip: cfg.ScannerIP},
 		jobs:        make(chan scanJob),
 		buttons:     make(chan ButtonEvent, 4),
+		wake:        make(chan struct{}, 1),
+		ctl:         make(chan ctlReq),
 		controlPort: cfg.ControlPort,
 		dataPort:    cfg.DataPort,
 	}
@@ -183,7 +207,8 @@ func (m *Manager) Status() Status {
 	return m.status
 }
 
-// Buttons delivers debounced Scan-button presses.
+// Buttons delivers debounced Scan-button presses. It is closed when Run
+// returns.
 func (m *Manager) Buttons() <-chan ButtonEvent { return m.buttons }
 
 // Scan runs one batch on the actor. It returns ErrBusy while another scan
@@ -230,16 +255,25 @@ func (m *Manager) setState(s State, detail string) {
 
 // Run owns the scanner until ctx is cancelled, then shuts down in order:
 // finish or abort the scan (D6 when possible), RELEASE, stop heartbeat,
-// mark the journal clean.
+// mark the journal clean. A Manager runs once.
 func (m *Manager) Run(ctx context.Context) error {
-	btn, err := m.listenButtons(ctx)
+	if !m.ran.CompareAndSwap(false, true) {
+		return errors.New("scansnap: manager already ran")
+	}
+	defer close(m.buttons)
+	stopButtons, err := m.listenButtons(ctx)
 	if err != nil {
 		return err
 	}
-	defer btn.Close()
+	defer stopButtons()
 
 	m.backoff = m.cfg.RetryMin
 	retry := time.After(0)
+	if st, err := m.jr.load(); err == nil && st.Released {
+		// Released before the last stop: stay off the scanner.
+		m.released, retry = true, nil
+		m.setState(StateReleased, "")
+	}
 	tick := time.NewTicker(m.cfg.StatusInterval)
 	defer tick.Stop()
 
@@ -259,14 +293,48 @@ func (m *Manager) Run(ctx context.Context) error {
 			}
 		case job := <-m.jobs:
 			m.runScan(ctx, job)
+		case req := <-m.ctl:
+			if req.release {
+				req.resp <- m.release(ctx)
+				retry = nil
+			} else {
+				changed, err := m.takeBack()
+				req.resp <- err
+				if changed {
+					m.backoff = m.cfg.RetryMin
+					retry = time.After(0)
+				}
+			}
+		case <-m.wake:
+			if m.released {
+				continue
+			}
+			if time.Since(m.lastWake) < m.cfg.AnnounceDebounce {
+				continue // the rest of the same burst
+			}
+			m.lastWake = time.Now()
+			if m.claimed {
+				// It restarted under us (e.g. chute closed and reopened between
+				// two polls): our session is gone, reclaim with the same token.
+				m.log.Info("scanner announced a restart; reclaiming")
+				m.stopHeartbeat()
+				m.claimed = false
+			} else {
+				m.log.Info("scanner announced itself; reconnecting now")
+			}
+			m.setState(StateConnecting, "scanner just started")
+			m.backoff = m.cfg.RetryMin
+			retry = time.After(0)
 		}
 	}
 }
 
+// nextBackoff doubles the retry delay, with up to 25% jitter so several
+// ScanSnaps that went offline together don't queue for discovery in lockstep.
 func (m *Manager) nextBackoff() time.Duration {
 	d := m.backoff
 	m.backoff = min(m.backoff*2, m.cfg.RetryMax)
-	return d
+	return d + rand.N(d/4+1)
 }
 
 // claim tries once to take the scanner and returns the delay before the next
@@ -276,6 +344,11 @@ func (m *Manager) claim(ctx context.Context) time.Duration {
 	if err != nil {
 		m.setState(StateNotConnected, "journal unreadable: "+err.Error())
 		return m.nextBackoff()
+	}
+	if st.Dirty && !st.belongsTo(m.cfg.ScannerIP) {
+		// Its token proves a session on another scanner: never reuse it here.
+		m.setState(StateNotConnected, "journal records a session of the scanner at "+st.ScannerIP)
+		return m.cfg.RetryMax
 	}
 	tok, adopted := st.token()
 	adopted = adopted && st.Dirty
@@ -323,7 +396,7 @@ func (m *Manager) claim(ctx context.Context) time.Duration {
 	}
 
 	localIP := vens.GetLocalIP(m.cfg.ScannerIP)
-	code, _, err := ctl.ConfigureStatus(tok, localIP, uint16(m.cfg.NotifyPort), identity)
+	code, _, err := ctl.ConfigureStatus(tok, localIP, uint16(m.notifyPort), identity)
 	if err != nil {
 		// The scanner may have processed the RESERVE: keep the journal dirty
 		// so the next attempt reuses this token.
@@ -354,10 +427,14 @@ func (m *Manager) claim(ctx context.Context) time.Duration {
 	case -4:
 		m.stopHeartbeat()
 		if adopted {
-			// Our own provable stale session: normal RELEASE with its token.
+			// Maybe our own stale session: normal RELEASE with its token. If
+			// the scanner refuses it (seen after a power cycle: the connection
+			// is closed), the session isn't ours to prove: treat it as held
+			// by someone else. A stale session of ours would expire on its own
+			// about 20 s after our last heartbeat.
 			if err := ctl.Deregister(tok); err != nil {
-				m.setState(StateNotConnected, "release of own stale session failed: "+err.Error())
-				return m.nextBackoff()
+				log.Warn("release with the journal token refused; treating the scanner as held by another client", "err", err)
+				break
 			}
 			if err := m.jr.clean(); err != nil {
 				m.setState(StateNotConnected, "journal write failed: "+err.Error())
@@ -457,10 +534,13 @@ func (m *Manager) runScan(runCtx context.Context, job scanJob) {
 		return
 	}
 	m.setState(StateScanning, "")
+	var res ScanResult
+	// Back to claimed before answering, so the caller can scan again at once.
 	defer func() {
 		if m.claimed {
 			m.setState(StateClaimed, "")
 		}
+		job.resp <- res
 	}()
 
 	ctx, cancel := context.WithCancel(job.ctx)
@@ -476,10 +556,9 @@ func (m *Manager) runScan(runCtx context.Context, job scanJob) {
 		if errors.As(err, &se) && se.Kind == vens.ScanErrNoPaper {
 			m.setStatus(func(st *Status) { st.Paper = false })
 		}
-		job.resp <- ScanResult{Err: err}
+		res.Err = err
 		return
 	}
-	res := ScanResult{}
 	for {
 		p, err := sess.NextPage()
 		if len(p.JPEG) > 0 {
@@ -501,7 +580,6 @@ func (m *Manager) runScan(runCtx context.Context, job scanJob) {
 		m.log.Debug("end scan", "err", err)
 	}
 	m.log.Info("scan finished", "pages", res.Pages, "err", res.Err)
-	job.resp <- res
 }
 
 func (m *Manager) startHeartbeat(ctx context.Context) error {
@@ -522,6 +600,77 @@ func (m *Manager) stopHeartbeat() {
 		m.hb.Stop()
 		m.hb = nil
 	}
+}
+
+// Release lets go of the scanner (normal RELEASE) so another computer can
+// claim it, and keeps scan-hub off it, across restarts, until TakeBack. It
+// returns ErrBusy during a scan.
+func (m *Manager) Release(ctx context.Context) error { return m.request(ctx, true) }
+
+// TakeBack ends a Release: scan-hub claims the scanner again as soon as it
+// is free.
+func (m *Manager) TakeBack(ctx context.Context) error { return m.request(ctx, false) }
+
+func (m *Manager) request(ctx context.Context, release bool) error {
+	if release && m.Status().State == StateScanning {
+		return ErrBusy
+	}
+	req := ctlReq{release: release, resp: make(chan error, 1)}
+	select {
+	case m.ctl <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-req.resp:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// release runs on the actor.
+func (m *Manager) release(ctx context.Context) error {
+	if m.released {
+		// Already off the scanner; make sure a restart remembers it (an
+		// earlier write may have failed).
+		return m.jr.setReleased(true)
+	}
+	if m.claimed {
+		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		err := m.control.WithContext(c).Deregister(m.token)
+		cancel()
+		m.claimed = false
+		if err != nil {
+			// The session expires on its own once the heartbeat stops; the
+			// dirty journal lets TakeBack reuse its token meanwhile.
+			m.log.Warn("RELEASE failed; the session will expire on its own", "err", err)
+		} else if err := m.jr.clean(); err != nil {
+			m.log.Warn("journal clean", "err", err)
+		}
+	}
+	m.stopHeartbeat()
+	m.released = true
+	m.setState(StateReleased, "")
+	if err := m.jr.setReleased(true); err != nil {
+		return fmt.Errorf("released, but not remembered across restarts: %w", err)
+	}
+	m.log.Info("released on request")
+	return nil
+}
+
+// takeBack runs on the actor; changed reports that a claim should start.
+func (m *Manager) takeBack() (changed bool, err error) {
+	if !m.released {
+		return false, nil
+	}
+	if err := m.jr.setReleased(false); err != nil {
+		return false, err
+	}
+	m.released = false
+	m.setState(StateConnecting, "")
+	m.log.Info("taking the scanner back")
+	return true, nil
 }
 
 // shutdown releases with its own bounded context (Run's ctx is already
@@ -549,26 +698,42 @@ func (m *Manager) shutdown() {
 
 // --- button events ---
 
-func (m *Manager) listenButtons(ctx context.Context) (*net.UDPConn, error) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: m.cfg.NotifyPort})
-	if err != nil {
-		return nil, fmt.Errorf("listen UDP %d (button events): %w", m.cfg.NotifyPort, err)
+// listenButtons subscribes to the hub (a private one without Config.Hub)
+// and forwards debounced presses to m.buttons. The returned stop waits for
+// the forwarder, so m.buttons can be closed after it.
+func (m *Manager) listenButtons(ctx context.Context) (func(), error) {
+	hub, own := m.cfg.Hub, false
+	if hub == nil {
+		h := NewNotifyHub(m.cfg.NotifyPort, m.cfg.Logger)
+		if err := h.Listen(); err != nil {
+			return nil, err
+		}
+		hub, own = h, true
+	} else if m.cfg.NotifyPort != 0 && m.cfg.NotifyPort != hub.Port() {
+		return nil, fmt.Errorf("scansnap: NotifyPort %d conflicts with the hub port %d", m.cfg.NotifyPort, hub.Port())
 	}
-	scanner := net.ParseIP(m.cfg.ScannerIP)
+	events, unsubscribe, err := hub.Subscribe(m.cfg.ScannerIP)
+	if err != nil {
+		if own {
+			hub.Close()
+		}
+		return nil, err
+	}
+	m.notifyPort = hub.Port()
+	done := make(chan struct{})
 	go func() {
-		buf := make([]byte, 256)
+		defer close(done)
 		var lastSeq uint32
 		var lastAt time.Time
-		for {
-			n, from, err := conn.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-			seq, ok := parseButton(buf[:n])
-			if !ok || !from.IP.Equal(scanner) {
-				m.log.Debug("ignored datagram on notify port", "from", from, "bytes", n)
+		for ev := range events {
+			if ev.Announce {
+				select {
+				case m.wake <- struct{}{}:
+				default:
+				}
 				continue
 			}
+			seq := ev.Seq
 			now := time.Now()
 			if seq == lastSeq && now.Sub(lastAt) < m.cfg.ButtonDebounce {
 				continue
@@ -578,22 +743,18 @@ func (m *Manager) listenButtons(ctx context.Context) (*net.UDPConn, error) {
 			select {
 			case m.buttons <- ButtonEvent{At: now, Seq: seq}:
 			case <-ctx.Done():
-				return
 			default:
 				m.log.Warn("button event dropped (consumer busy)")
 			}
 		}
 	}()
-	return conn, nil
-}
-
-// parseButton accepts only the exact 48-byte VENS event type 1 and returns
-// its per-press counter (data field at offset 16).
-func parseButton(p []byte) (uint32, bool) {
-	if len(p) != 48 || [4]byte(p[4:8]) != vens.Magic || binary.BigEndian.Uint32(p[8:12]) != 1 {
-		return 0, false
-	}
-	return binary.BigEndian.Uint32(p[16:20]), true
+	return func() {
+		unsubscribe()
+		if own {
+			hub.Close()
+		}
+		<-done
+	}, nil
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {

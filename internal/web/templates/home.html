@@ -8,18 +8,16 @@
   <h2 id="start-title" class="section-title">Start a session</h2>
   <p class="lede">Collect pages, check them, then send them to Paperless as one PDF.</p>
   <div class="tickets">
-    {{if .Status.HasScanSnap}}
-    <button type="button" class="ticket" hx-post="/sessions" hx-vals='{"scanner":"scansnap"}' hx-disable="this">
-      <span class="ticket-kicker">Feeder</span>
-      <span class="ticket-title">A stack of sheets</span>
-      <span class="ticket-sub">ScanSnap · duplex · batch</span>
-    </button>
-    {{end}}
-    {{if .Status.HasEpson}}
-    <button type="button" class="ticket ticket-alt" hx-post="/sessions" hx-vals='{"scanner":"epson"}' hx-disable="this">
-      <span class="ticket-kicker">Glass</span>
+    {{range .Status.Scanners}}
+    <button type="button" class="ticket{{if isFlatbed .Kind}} ticket-alt{{end}}" data-scanner="{{.ID}}" hx-post="/sessions" hx-vals='{"scanner":"{{.ID}}"}' hx-disable="this">
+      <span class="ticket-kicker">{{kindLabel .Kind}}</span>
+      {{if isFlatbed .Kind}}
       <span class="ticket-title">Booklets &amp; fragile pages</span>
-      <span class="ticket-sub">Epson · one page per pass</span>
+      <span class="ticket-sub">{{.Name}} · one page per pass</span>
+      {{else}}
+      <span class="ticket-title">A stack of sheets</span>
+      <span class="ticket-sub">{{.Name}} · batch</span>
+      {{end}}
     </button>
     {{end}}
   </div>

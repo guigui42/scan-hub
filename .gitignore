@@ -8,6 +8,7 @@
 
 # Local runtime data and secrets
 /data/
+/scanners.yaml
 .env
 *.env
 !*.env.example

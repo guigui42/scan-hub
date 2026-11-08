@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -18,11 +19,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/guigui42/scan-hub/internal/config"
 	"github.com/guigui42/scan-hub/internal/escl"
 	"github.com/guigui42/scan-hub/internal/escl/escltest"
 	"github.com/guigui42/scan-hub/internal/paperless"
 	"github.com/guigui42/scan-hub/internal/paperless/paperlesstest"
+	"github.com/guigui42/scan-hub/internal/scanner"
+	"github.com/guigui42/scan-hub/internal/scanner/escldrv"
+	"github.com/guigui42/scan-hub/internal/scanner/scansnapdrv"
 	"github.com/guigui42/scan-hub/internal/scansnap"
 	"github.com/guigui42/scan-hub/internal/session"
 	"github.com/guigui42/scan-hub/internal/vens"
@@ -86,11 +89,14 @@ func newRig(t *testing.T) *rig {
 	go func() { ob.Run(ctx); close(obDone) }()
 	store, _ := session.Open(filepath.Join(dir, "sessions"), session.Options{MinFreeBytes: -1})
 
+	devs := []scanner.Device{
+		scansnapdrv.NewDevice("feeder", "ScanSnap iX500", mgr, vens.DefaultScanConfig(), vens.DefaultScanConfig()),
+		escldrv.NewDevice("glass", "Epson ET-2750", epc, escldrv.DefaultProfile, 0),
+	}
 	ws, err := New(ctx, Config{
-		KeyPath: filepath.Join(dir, "csrf.key"), ScanSnap: vens.DefaultScanConfig(),
-		Epson: config.EpsonProfile{ColorMode: escl.ColorRGB24, DPI: 300, Region: "a4"}, Version: "test",
+		KeyPath: filepath.Join(dir, "csrf.key"), Version: "test",
 		PaperlessURL: "https://paperless.example", Logger: log,
-	}, Deps{ScanSnap: mgr, Epson: epc, Store: store, Outbox: ob, Paperless: pc, DataDir: dir})
+	}, Deps{Scanners: devs, Store: store, Outbox: ob, Paperless: pc, DataDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,19 +234,19 @@ func waitJob(t *testing.T, r *rig, body string) string {
 func TestDeskScanSendFlow(t *testing.T) {
 	r := newRig(t)
 	r.get("/")
-	code, _, h := r.send("POST", "/sessions", url.Values{"scanner": {"epson"}}, nil)
+	code, _, h := r.send("POST", "/sessions", url.Values{"scanner": {"glass"}}, nil)
 	if code != http.StatusNoContent || !strings.HasPrefix(h.Get("HX-Redirect"), "/sessions/") {
 		t.Fatalf("create %d %v", code, h)
 	}
 	loc := h.Get("HX-Redirect")
-	sid := strings.TrimSuffix(strings.TrimPrefix(loc, "/sessions/"), "?scanner=epson")
+	sid := strings.TrimSuffix(strings.TrimPrefix(loc, "/sessions/"), "?scanner=glass")
 	code, body, _ := r.get(loc)
-	if code != 200 || !strings.Contains(body, `data-scanner="epson"`) || !strings.Contains(body, "Nothing on the desk") {
+	if code != 200 || !strings.Contains(body, `<div class="session" x-data="sessionPage" data-scanner="glass">`) || !strings.Contains(body, "Nothing on the desk") {
 		t.Fatalf("session page %d", code)
 	}
 
 	// Epson pass.
-	code, body, _ = r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"epson"}, "ep_color": {"color"}, "ep_dpi": {"300"}, "ep_region": {"a4"}}, nil)
+	code, body, _ = r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"glass"}, "color": {"color"}, "dpi": {"300"}, "region": {"a4"}}, nil)
 	if code != http.StatusAccepted {
 		t.Fatalf("epson scan %d %s", code, body)
 	}
@@ -250,7 +256,7 @@ func TestDeskScanSendFlow(t *testing.T) {
 
 	// ScanSnap duplex batch of 2 sheets.
 	r.ss.LoadPaper(2)
-	code, body, _ = r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"scansnap"}, "ss_color": {"auto"}, "ss_dpi": {"300"}, "ss_paper": {"auto"}, "ss_duplex": {"on"}}, nil)
+	code, body, _ = r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"feeder"}, "color": {"auto"}, "dpi": {"300"}, "paper": {"auto"}, "duplex": {"on"}}, nil)
 	if code != http.StatusAccepted {
 		t.Fatalf("scansnap scan %d %s", code, body)
 	}
@@ -315,7 +321,7 @@ func TestErrorsAndOutboxActions(t *testing.T) {
 	if code != 422 || !strings.Contains(body, "at least one page") {
 		t.Fatalf("empty send %d %s", code, body)
 	}
-	code, body, _ = r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"scansnap"}, "ss_color": {"auto"}, "ss_dpi": {"300"}, "ss_paper": {"auto"}}, nil)
+	code, body, _ = r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"feeder"}, "color": {"auto"}, "dpi": {"300"}, "paper": {"auto"}}, nil)
 	if code != http.StatusAccepted {
 		t.Fatalf("scan %d", code)
 	}
@@ -329,7 +335,7 @@ func TestErrorsAndOutboxActions(t *testing.T) {
 	// A failed delivery can be retried and discarded from the UI.
 	r.pl.Set(func(s *paperlesstest.Server) { s.Next = paperlesstest.Fail })
 	r.ss.LoadPaper(1)
-	_, body, _ = r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"scansnap"}, "ss_color": {"auto"}, "ss_dpi": {"300"}, "ss_paper": {"auto"}}, nil)
+	_, body, _ = r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"feeder"}, "color": {"auto"}, "dpi": {"300"}, "paper": {"auto"}}, nil)
 	waitJob(t, r, body)
 	r.send("POST", "/sessions/"+sid+"/send", nil, nil)
 	var id string
@@ -403,7 +409,7 @@ func TestStatusCacheIgnoresAbortedRequests(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // the browser went away before the probe ran
 	v := r.ws.status(ctx)
-	if v.Epson.State != "Idle" || !v.Paperless.Reachable {
+	if len(v.Scanners) != 2 || v.Scanners[1].Status.Label != "Ready" || !v.Paperless.Reachable {
 		t.Fatalf("aborted request poisoned the cache: %+v", v)
 	}
 }
@@ -414,11 +420,85 @@ func TestDeskFragmentShowsButtonSessions(t *testing.T) {
 	if !strings.Contains(body, `hx-get="/fragments/desk"`) {
 		t.Fatal("desk lists are not polled")
 	}
-	m, _ := r.store.Create("scansnap-button") // as the physical button does
-	r.store.AddPage(m.ID, venstest.PageJPEG(0, 0), "scansnap", 0, 0)
+	m, _ := r.store.Create("button:feeder") // as the physical button does
+	r.store.AddPage(m.ID, venstest.PageJPEG(0, 0), "feeder", 0, 0)
+	old, _ := r.store.Create("scansnap-button") // stored by an earlier release
 	code, body, _ := r.get("/fragments/desk")
-	if code != 200 || !strings.Contains(body, "/sessions/"+m.ID) || !strings.Contains(body, "ScanSnap button") {
+	if code != 200 || !strings.Contains(body, "/sessions/"+m.ID) || !strings.Contains(body, "ScanSnap iX500 button") ||
+		!strings.Contains(body, "/sessions/"+old.ID) || !strings.Contains(body, "ScanSnap button") {
 		t.Fatalf("desk fragment %d:\n%s", code, body)
+	}
+}
+
+func TestLabelsOfUnknownAndLegacyScanners(t *testing.T) {
+	r := newRig(t)
+	for in, want := range map[string]string{"feeder": "ScanSnap iX500", "scansnap": "ScanSnap", "epson": "Epson", "gone-scanner": "gone-scanner"} {
+		if got := r.ws.scannerLabel(in); got != want {
+			t.Errorf("scannerLabel(%q) = %q, want %q", in, got, want)
+		}
+	}
+	for in, want := range map[string]string{"ui": "Desk", "button:feeder": "ScanSnap iX500 button", "button:gone": "gone button",
+		"cli:glass": "Epson ET-2750 (command line)", "scansnap-button": "ScanSnap button", "epson": "Epson", "weird": "weird"} {
+		if got := r.ws.sourceLabel(in); got != want {
+			t.Errorf("sourceLabel(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestEveryScannerGetsCardTicketAndForm(t *testing.T) {
+	r := newRig(t)
+	_, body, _ := r.get("/")
+	for _, want := range []string{`data-scanner="feeder" hx-post="/sessions"`, `data-scanner="glass" hx-post="/sessions"`,
+		`<article class="card" data-tone="ok" data-scanner="feeder">`, `ScanSnap <em>iX500</em>`, `Press <kbd>Scan</kbd>`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("desk lacks %q", want)
+		}
+	}
+	_, _, h := r.send("POST", "/sessions", url.Values{"scanner": {"feeder"}}, nil)
+	_, body, _ = r.get(h.Get("HX-Redirect"))
+	for _, want := range []string{`<input type="hidden" name="scanner" value="feeder">`, `<input type="hidden" name="scanner" value="glass">`,
+		`name="paper"`, `name="region"`, `Feed the stack`, `Scan the glass`, `Glass <small>Epson ET-2750</small>`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("session page lacks %q", want)
+		}
+	}
+	if !strings.Contains(body, `data-scanner="glass" x-show="shown" x-cloak`) || strings.Contains(body, `data-scanner="feeder" x-show="shown" x-cloak`) {
+		t.Fatal("only the active scanner's form should be visible before Alpine starts")
+	}
+
+	_, _, h = r.send("POST", "/sessions", url.Values{"scanner": {"nope"}}, nil)
+	if loc := h.Get("HX-Redirect"); strings.Contains(loc, "scanner=") {
+		t.Fatalf("unknown scanner kept in %q", loc)
+	}
+	sid := strings.TrimPrefix(h.Get("HX-Redirect"), "/sessions/")
+	if code, body, _ := r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"nope"}}, nil); code != 400 || !strings.Contains(body, "Pick a scanner") {
+		t.Fatalf("unknown scanner scan: %d %s", code, body)
+	}
+	if code, body, _ := r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"glass"}, "color": {"pink"}, "dpi": {"300"}, "region": {"a4"}}, nil); code != 422 || !strings.Contains(body, "Invalid settings for Epson ET-2750") {
+		t.Fatalf("bad settings: %d %s", code, body)
+	}
+}
+
+func TestStatusJSONKeyedByScanner(t *testing.T) {
+	r := newRig(t)
+	_, body, _ := r.get("/status")
+	var out struct {
+		Scanners map[string]struct {
+			Name, Kind, State string
+			Device            map[string]any
+		}
+		Paperless map[string]any
+	}
+	if err := json.Unmarshal([]byte(body), &out); err != nil {
+		t.Fatal(err)
+	}
+	f, g := out.Scanners["feeder"], out.Scanners["glass"]
+	if f.Name != "ScanSnap iX500" || f.Kind != "feeder" || f.State != "Ready" || f.Device["state"] != "claimed" ||
+		g.Kind != "flatbed" || g.State != "Ready" || out.Paperless == nil {
+		t.Fatalf("status: %s", body)
+	}
+	if strings.Contains(body, "4242") {
+		t.Fatal("password in /status")
 	}
 }
 
@@ -454,5 +534,41 @@ func TestDownloadSessionPDF(t *testing.T) {
 	}
 	if _, err := r.store.Get(sid); err != nil {
 		t.Fatal("download must not consume the session")
+	}
+}
+
+func TestReleaseAndTakeBackFromTheDesk(t *testing.T) {
+	r := newRig(t)
+	_, body, _ := r.get("/")
+	if !strings.Contains(body, `hx-post="/scanners/feeder/release"`) || strings.Contains(body, `/scanners/glass/release`) {
+		t.Fatal("only the ScanSnap card offers Release")
+	}
+	code, body, _ := r.send("POST", "/scanners/feeder/release", nil, nil)
+	if code != 200 || !strings.Contains(body, ">Released<") || !strings.Contains(body, `hx-post="/scanners/feeder/take-back"`) {
+		t.Fatalf("release %d:\n%s", code, body)
+	}
+	if _, held := r.ss.Holder(); held {
+		t.Fatal("still held")
+	}
+	_, _, h := r.send("POST", "/sessions", nil, nil)
+	sid := strings.TrimPrefix(h.Get("HX-Redirect"), "/sessions/")
+	if code, body, _ := r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"feeder"}, "color": {"auto"}, "dpi": {"300"}, "paper": {"auto"}}, nil); code != 409 || !strings.Contains(body, "is released") {
+		t.Fatalf("scan while released: %d %s", code, body)
+	}
+	if code, _, _ := r.send("POST", "/scanners/glass/release", nil, nil); code != 404 {
+		t.Fatalf("eSCL release: %d", code)
+	}
+	if code, body, _ := r.send("POST", "/scanners/feeder/take-back", nil, nil); code != 200 || !strings.Contains(body, `/scanners/feeder/release`) {
+		t.Fatalf("take back %d:\n%s", code, body)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, held := r.ss.Holder(); held {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("not reclaimed after take back")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

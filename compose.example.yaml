@@ -1,13 +1,14 @@
-# scan-hub — example Compose service. Linux Docker only: host networking is required so the ScanSnap can
-# reach UDP 55264/55265 (discovery replies, Scan-button events) and the 0.5 s
-# heartbeat works. Docker Desktop's host networking is not supported.
+# scan-hub — example Compose service. Linux Docker only: host networking is required so ScanSnaps can
+# reach UDP 55264/55265 (discovery replies, Scan-button events), their power-on
+# broadcast reaches UDP 53220, and the 0.5 s heartbeat works. Docker Desktop's host networking is not supported.
 #
 # Local test with the gitignored .env (values are interpolated, not passed
 # wholesale):
 #   docker build -t scan-hub:dev .
 #   SCANHUB_IMAGE=scan-hub:dev docker compose --env-file .env -f compose.example.yaml up
 #
-# All configuration is environment variables; see README.md for the full table.
+# Settings are environment variables (see README.md); the scanner list is a
+# YAML file mounted read-only (see scanners.example.yaml).
 
 services:
   scan-hub:
@@ -16,7 +17,7 @@ services:
     network_mode: host
     init: true
     restart: unless-stopped
-    # Leaves time to finish or abort a scan and RELEASE the ScanSnap.
+    # Leaves time to finish or abort a scan and RELEASE the ScanSnaps.
     stop_grace_period: 30s
     read_only: true
     cap_drop: [ALL]
@@ -25,6 +26,8 @@ services:
       - /tmp
     volumes:
       - scan-hub-data:/data
+      # Must be readable by UID 65532 (the image's user).
+      - ./scanners.yaml:/config/scanners.yaml:ro
       # If the host's /etc/resolv.conf is not world-readable, the non-root
       # user can't resolve host names (e.g. a Paperless URL). Mount a readable
       # copy:
@@ -36,16 +39,9 @@ services:
       SCANHUB_ALLOWED_HOSTS: ${SCANHUB_ALLOWED_HOSTS:-}
       SCANHUB_LOG_LEVEL: ${SCANHUB_LOG_LEVEL:-info}
 
-      SCANHUB_SCANSNAP_IP: ${SCANHUB_SCANSNAP_IP:-}
+      SCANHUB_SCANNERS_FILE: /config/scanners.yaml
+      # Named by `password_env` in the scanner list.
       SCANHUB_SCANSNAP_PASSWORD: ${SCANHUB_SCANSNAP_PASSWORD:-}
-      SCANHUB_BUTTON_COLOR: ${SCANHUB_BUTTON_COLOR:-auto}
-      SCANHUB_BUTTON_DPI: ${SCANHUB_BUTTON_DPI:-300}
-      SCANHUB_BUTTON_DUPLEX: ${SCANHUB_BUTTON_DUPLEX:-true}
-      SCANHUB_BUTTON_PAPER: ${SCANHUB_BUTTON_PAPER:-auto}
-      SCANHUB_BUTTON_BLANK_PAGE_REMOVAL: ${SCANHUB_BUTTON_BLANK_PAGE_REMOVAL:-true}
-
-      SCANHUB_EPSON_URL: ${SCANHUB_EPSON_URL:-}
-      SCANHUB_EPSON_TLS_PIN: ${SCANHUB_EPSON_TLS_PIN:-}
 
       SCANHUB_PAPERLESS_URL: ${SCANHUB_PAPERLESS_URL:-}
       SCANHUB_PAPERLESS_TOKEN: ${SCANHUB_PAPERLESS_TOKEN:-}

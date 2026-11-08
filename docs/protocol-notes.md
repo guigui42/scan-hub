@@ -79,6 +79,25 @@ The AirScap code worked unchanged on protocol `0x0006`.
 Example:
 `0000003056454e530000000100000000020000000000…` (48 bytes).
 
+## 3b. Power-on announcement (UDP 53220, 2026-11-07)
+
+Passive capture on the host (nothing sent to the scanner) while the paper
+chute was closed (power off) and opened again (power on):
+
+- On power-on, once on Wi-Fi, the scanner broadcast **6 identical 48-byte
+  datagrams to UDP 53220 within about 1 s**, from two ephemeral source ports.
+- Payload: magic `VENS` at offset 4, **command `0x21`** at 8, `0x01000000` at
+  16, **its IPv4 at 20**, **its MAC at 24** (matches
+  `vens.ParseBroadcastAdvertisement`).
+- Nothing was received on 53220, 55264 or 55265 when powering off. While idle
+  and powered, no broadcast came within 22 s (earlier check).
+- **Decision:** treat an announcement from a configured ScanSnap's IP as "it
+  just started": reclaim at once (reusing the journal token) instead of
+  waiting for the retry backoff, and debounce the burst.
+
+Example (IP and MAC redacted):
+`0000003056454e53000000210000000001000000c0a80132aabbccddeeff0000…` (48 bytes).
+
 ## 4. Ownership, restart and crash recovery
 
 | Scenario | Observed |
@@ -95,6 +114,8 @@ Example:
 | Adopt an *expired* journal token (after the timeout) | RESERVE 0 (it behaves like a new session) |
 | `-7` (another client holds the scanner) | not tested (no foreign client); deferred with the release feature |
 
+| After a power cycle (chute closed and opened), RESERVE with the dirty **journal token** (2026-11-07) | **`-4`**, and `RELEASE` action 0 with that token: the scanner **closes the connection** (EOF). Who held it is unknown (another client grabbing it at power-on, e.g. ScanSnap Home, is possible). scan-hub then looped on the token until the fix below. |
+
 **Recovery rules for `internal/scansnap`:**
 
 1. Persist the token with `dirty=true` (fsync and rename) **before** RESERVE.
@@ -104,7 +125,10 @@ Example:
    heartbeat, then RESERVE. This works both within and after the stale window.
 3. If that RESERVE fails with `-4`, send `RELEASE` (action 0) with the journal
    token only, mark the journal clean, then claim with a fresh token. Never use
-   ENFORCE, and never release a token that scan-hub didn't create.
+   ENFORCE, and never release a token that scan-hub didn't create. If that
+   RELEASE is refused (connection closed), mark the journal clean anyway and
+   go to rule 4: the token proves nothing, and a stale session of ours expires
+   on its own.
 4. Otherwise (for example `-7`, or `-4` that persists), treat the scanner as
    held by someone else: back off and retry. The stale window is about 20 s.
 5. For liveness while claimed, use `GET_WIFI_STATUS` / `C2`, not discovery.
@@ -117,6 +141,8 @@ Example:
 
 - `-7` behaviour and Windows coexistence (deferred with the release feature).
 - B&W (TIFF) and longer multi-sheet batches.
+- Who held the scanner after the power cycle that answered `-4` to the
+  journal token (now shown as the holder on the card).
 - Whether the button counter survives a scanner power cycle (debounce falls
   back to a 5 s window if it repeats).
 
@@ -138,7 +164,7 @@ The `scan-hub` binary ran from the desktop against the real scanner:
 | Item | Value |
 |---|---|
 | TLS | Self-signed `CN=printer, O=SEIKO EPSON CORP.`, valid 2010–2038, SAN `printer`, `printer.local` and the printer's IP; TLS 1.2 `ECDHE-RSA-AES128-GCM-SHA256` |
-| Pin (`SCANHUB_EPSON_TLS_PIN`) | SHA-256 of the certificate's SPKI; it is per device, see `.env.example` for the capture command |
+| Pin (`tls_pin` in the scanner list) | SHA-256 of the certificate's SPKI; it is per device, see `scanners.example.yaml` for the capture command |
 | eSCL | Version 2.63, `EPSON ET-2750 Series`, platen only, max 2550×3510 (1/300 in), 100/200/300/600/1200 dpi, `BlackAndWhite1`/`Grayscale8`/`RGB24`, JPEG or PDF |
 | Scan | `POST /eSCL/ScanJobs` (A4 2480×3508, RGB24, 300 dpi, JPEG) → `201`, job `/eSCL/ScanJobs/<uuid>`; `NextDocument` blocks until the image is ready: **about 28 s** for A4 colour at 300 dpi; a 2480×3508 JFIF 300-dpi JPEG of about 575 KB; then back to `Idle` |
 

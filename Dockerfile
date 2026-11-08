@@ -14,7 +14,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}"
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="scan-hub" \
-      org.opencontainers.image.description="ScanSnap iX500 (VENS) and Epson (eSCL) Wi-Fi scanning to Paperless-ngx" \
+      org.opencontainers.image.description="ScanSnap (VENS) and eSCL/AirScan Wi-Fi scanning to Paperless-ngx" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.source="https://github.com/guigui42/scan-hub" \
       org.opencontainers.image.version="${VERSION}"

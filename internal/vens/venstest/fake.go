@@ -5,6 +5,7 @@ package venstest
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -25,12 +26,23 @@ type Options struct {
 	EndOfBatchQuirk  bool          // report 0x2000 + ADF empty after the last sheet (AirScap #1)
 	ButtonInterval   time.Duration // spacing of the 3 repeated button datagrams; default 20 ms
 	WaitDelay        time.Duration // delay before answering WAIT FOR SCAN (E0)
+	// IP is the loopback address the fake binds and sends from; default
+	// 127.0.0.1. Other 127/8 addresses work on Linux (macOS needs lo0 aliases).
+	IP string
+	// HeartbeatACK makes the fake answer each heartbeat with a short datagram
+	// to the advertised reply port, as discovery must skip such packets.
+	HeartbeatACK bool
+	// CloseOnForeignRelease closes the control connection without a reply
+	// when RELEASE carries a token that isn't the current session's, as the
+	// iX500 did after a power cycle.
+	CloseOnForeignRelease bool
 }
 
 // Scanner is a running fake.
 type Scanner struct {
 	opts     Options
 	identity string
+	ip       net.IP
 
 	udp     *net.UDPConn
 	control net.Listener
@@ -39,6 +51,7 @@ type Scanner struct {
 	mu         sync.Mutex
 	sess       *session
 	paper      int
+	off        bool // powered off: silent on UDP, refuses TCP sessions
 	sheetsDone int
 	buttonSeq  byte
 	stats      Stats
@@ -64,8 +77,15 @@ type Stats struct {
 	PagesServed    int
 }
 
-// Start launches the fake on 127.0.0.1 with ephemeral ports.
+// Start launches the fake on opts.IP (default 127.0.0.1) with ephemeral ports.
 func Start(opts Options) (*Scanner, error) {
+	if opts.IP == "" {
+		opts.IP = "127.0.0.1"
+	}
+	ip := net.ParseIP(opts.IP).To4()
+	if ip == nil || !ip.IsLoopback() {
+		return nil, fmt.Errorf("venstest: IP must be an IPv4 loopback address, got %q", opts.IP)
+	}
 	if opts.HeartbeatTimeout == 0 {
 		opts.HeartbeatTimeout = time.Second
 	}
@@ -79,15 +99,15 @@ func Start(opts Options) (*Scanner, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Scanner{opts: opts, identity: id, buttonSeq: 1}
-	if s.udp, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}); err != nil {
+	s := &Scanner{opts: opts, identity: id, ip: ip, buttonSeq: 1}
+	if s.udp, err = net.ListenUDP("udp4", &net.UDPAddr{IP: ip}); err != nil {
 		return nil, err
 	}
-	if s.control, err = net.Listen("tcp4", "127.0.0.1:0"); err != nil {
+	if s.control, err = net.Listen("tcp4", net.JoinHostPort(opts.IP, "0")); err != nil {
 		s.udp.Close()
 		return nil, err
 	}
-	if s.data, err = net.Listen("tcp4", "127.0.0.1:0"); err != nil {
+	if s.data, err = net.Listen("tcp4", net.JoinHostPort(opts.IP, "0")); err != nil {
 		s.udp.Close()
 		s.control.Close()
 		return nil, err
@@ -100,7 +120,7 @@ func Start(opts Options) (*Scanner, error) {
 }
 
 // IP is the fake's address.
-func (s *Scanner) IP() string { return "127.0.0.1" }
+func (s *Scanner) IP() string { return s.ip.String() }
 
 // DiscoveryPort, ControlPort and DataPort are the fake's listening ports.
 func (s *Scanner) DiscoveryPort() int { return s.udp.LocalAddr().(*net.UDPAddr).Port }
@@ -168,7 +188,8 @@ func (s *Scanner) PressButton() bool {
 	pkt[16] = s.buttonSeq
 	s.mu.Unlock()
 
-	c, err := net.DialUDP("udp4", nil, addr)
+	// Send from the fake's own address: routers of button events match on it.
+	c, err := net.DialUDP("udp4", &net.UDPAddr{IP: s.ip}, addr)
 	if err != nil {
 		return false
 	}
@@ -207,13 +228,22 @@ func (s *Scanner) serveUDP() {
 		port := int(binary.BigEndian.Uint16(p[22:24]))
 
 		s.mu.Lock()
+		if s.off {
+			s.mu.Unlock()
+			continue
+		}
 		live := s.liveLocked()
 		if heartbeat {
 			s.stats.Heartbeats++
+			ack := false
 			if s.sess != nil && s.sess.token == tok && live {
 				s.sess.lastHB = time.Now()
+				ack = s.opts.HeartbeatACK
 			}
 			s.mu.Unlock()
+			if ack {
+				s.udp.WriteToUDP(heartbeatACK(), &net.UDPAddr{IP: clientIP, Port: port})
+			}
 			continue
 		}
 		// Observed on hardware: no reply to discovery carrying the holder's
@@ -234,7 +264,7 @@ func (s *Scanner) deviceInfoLocked(live bool) []byte {
 	binary.BigEndian.PutUint16(p[8:], 0x0006)
 	binary.BigEndian.PutUint16(p[10:], 0x0030)
 	binary.BigEndian.PutUint32(p[12:], 0xFFFFFFFF)
-	copy(p[16:], net.IPv4(127, 0, 0, 1).To4())
+	copy(p[16:], s.ip)
 	binary.BigEndian.PutUint16(p[22:], uint16(s.DataPort()))
 	binary.BigEndian.PutUint16(p[26:], uint16(s.ControlPort()))
 	copy(p[28:], []byte{0x00, 0x80, 0x92, 0x00, 0x00, 0x01})
@@ -249,6 +279,50 @@ func (s *Scanner) deviceInfoLocked(live bool) []byte {
 	return p
 }
 
+// PowerOff simulates closing the paper chute: the session is lost and the
+// fake stops answering.
+func (s *Scanner) PowerOff() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.off, s.sess = true, nil
+}
+
+// PowerOn simulates opening the chute. Like the iX500 on joining Wi-Fi, it
+// then broadcasts its power-on announcement (command 0x21) three times to
+// UDP announcePort on 127.0.0.1, from its own address; 0 skips that.
+func (s *Scanner) PowerOn(announcePort int) {
+	s.mu.Lock()
+	s.off = false
+	s.mu.Unlock()
+	if announcePort == 0 {
+		return
+	}
+	c, err := net.DialUDP("udp4", &net.UDPAddr{IP: s.ip}, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: announcePort})
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	p := make([]byte, 48)
+	binary.BigEndian.PutUint32(p[0:], 48)
+	copy(p[4:], vens.Magic[:])
+	binary.BigEndian.PutUint32(p[8:], vens.CmdBroadcast)
+	p[16] = 1
+	copy(p[20:], s.ip)
+	copy(p[24:], []byte{0x00, 0x80, 0x92, 0x00, 0x00, 0x01})
+	for range 3 {
+		c.Write(p)
+	}
+}
+
+// heartbeatACK is a short VENS datagram; its exact layout is not decoded by
+// clients, which only need to tell it apart from a device-info reply.
+func heartbeatACK() []byte {
+	p := make([]byte, 32)
+	binary.BigEndian.PutUint32(p[0:], 32)
+	copy(p[4:], vens.Magic[:])
+	return p
+}
+
 // --- TCP ---
 
 func (s *Scanner) serveTCP(l net.Listener, h func(net.Conn)) {
@@ -259,6 +333,13 @@ func (s *Scanner) serveTCP(l net.Listener, h func(net.Conn)) {
 		c, err := l.Accept()
 		if err != nil {
 			return
+		}
+		s.mu.Lock()
+		off := s.off
+		s.mu.Unlock()
+		if off {
+			c.Close()
+			continue
 		}
 		conns.Add(1)
 		go func() {
@@ -340,6 +421,10 @@ func (s *Scanner) handleControl(c net.Conn) {
 		case vens.CmdRelease:
 			action := binary.BigEndian.Uint32(p[24:28])
 			s.mu.Lock()
+			if s.opts.CloseOnForeignRelease && (s.sess == nil || s.sess.token != tok) {
+				s.mu.Unlock()
+				return
+			}
 			s.stats.Releases++
 			s.stats.ReleaseActions = append(s.stats.ReleaseActions, action)
 			if s.sess != nil && s.sess.token == tok {

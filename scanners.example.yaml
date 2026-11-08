@@ -1,0 +1,46 @@
+# scan-hub scanner list. Copy to scanners.yaml (gitignored) and point
+# SCANHUB_SCANNERS_FILE at it (an absolute path; in Docker, mount it read-only).
+# Unknown keys are errors. Each scanner needs a unique id: it appears in URLs,
+# in page records and in the ScanSnap journal path, so don't rename it while
+# a ScanSnap session may still be open (see the README).
+#
+# Types:
+#   scansnap  ScanSnap iX500 over Wi-Fi (VENS). Several work; each needs its
+#             own fixed IPv4 (DHCP reservation), reachable without NAT.
+#   escl      Any eSCL / AirScan scanner's flatbed (most Wi-Fi printers).
+
+scanners:
+  - id: feeder                 # 1-32 of a-z, 0-9, '-'
+    type: scansnap
+    name: ScanSnap iX500       # display name; defaults to the id
+    ip: 192.168.1.50
+    # The Wi-Fi password (factory default: last 4 digits of the serial), from
+    # exactly one of:
+    password_env: SCANHUB_SCANSNAP_PASSWORD
+    # password_file: /run/secrets/scansnap_password
+    # Form defaults in the web UI (shown values are the built-in defaults):
+    defaults:
+      color: auto              # auto | color | gray | bw
+      dpi: 300                 # auto | 150 | 200 | 300
+      paper: auto              # auto | a4 | a5 | business-card | postcard
+      duplex: true
+      blank_page_removal: true
+      multifeed: true          # stop on multi-feed (not in the UI form)
+    # Profile of the scanner's own Scan button; same keys, same built-in
+    # defaults. Without this section the button uses `defaults`.
+    button:
+      dpi: 300
+
+  - id: glass
+    type: escl
+    name: Epson ET-2750
+    url: https://192.168.1.60
+    # https needs exactly one of tls_pin (hex SHA-256 of the certificate's
+    # SPKI, or of the whole certificate) and tls_insecure: true. Capture:
+    #   echo | openssl s_client -connect 192.168.1.60:443 2>/dev/null | openssl x509 -pubkey -noout \
+    #     | openssl pkey -pubin -outform der | openssl dgst -sha256
+    tls_pin: 0000000000000000000000000000000000000000000000000000000000000000
+    defaults:
+      color: color             # color | gray | bw
+      dpi: 300                 # 100 | 200 | 300 | 600
+      region: a4               # a4 | letter | max (whole glass)

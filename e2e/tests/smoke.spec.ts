@@ -10,9 +10,11 @@ function watchErrors(page: Page): string[] {
   return errors
 }
 
-async function newSession(page: Page, kind: 'Feeder' | 'Glass'): Promise<string> {
+// Demo scanners: feeder and feeder-2 (fake ScanSnaps; feeder-2 needs
+// 127.0.0.2), glass and glass-2 (fake eSCL).
+async function newSession(page: Page, scanner: string): Promise<string> {
   await page.goto('/')
-  await page.locator('.ticket', { hasText: kind }).click()
+  await page.locator(`.ticket[data-scanner="${scanner}"]`).click()
   await page.waitForURL(/\/sessions\/[0-9-a-f]+/)
   return new URL(page.url()).pathname
 }
@@ -21,14 +23,18 @@ test('desk renders device cards without CSP or JS errors', async ({ page }) => {
   const errors = watchErrors(page)
   await page.goto('/')
   await expect(page.locator('h1')).toContainText('filing')
-  await expect(page.locator('#status .card')).toHaveCount(3)
-  await expect(page.locator('#status .stamp').first()).toHaveText(/Ready|Connecting/)
+  // Two or three scanners besides glass and glass-2 (feeder-2 only where
+  // 127.0.0.2 can be bound), plus Paperless.
+  const cards = await page.locator('#status .card').count()
+  expect(cards).toBeGreaterThanOrEqual(4)
+  await expect(page.locator('#status .card[data-scanner="feeder"] .stamp')).toHaveText(/Ready|Connecting/)
+  await expect(page.locator('#status .card[data-scanner="glass-2"] h3')).toHaveText('Office AirScan')
   expect(errors).toEqual([])
 })
 
 test('feeder scan runs as a polled job and pages appear without reload', async ({ page }) => {
   const errors = watchErrors(page)
-  await newSession(page, 'Feeder')
+  await newSession(page, 'feeder')
   await page.getByRole('button', { name: 'Feed the stack' }).click()
   await expect(page.locator('#job')).toContainText('pages added', { timeout: 15_000 })
   await expect(page.locator('#pages .sheet')).toHaveCount(6)
@@ -37,7 +43,7 @@ test('feeder scan runs as a polled job and pages appear without reload', async (
 })
 
 test('double-clicking Scan starts a single job', async ({ page }) => {
-  await newSession(page, 'Feeder')
+  await newSession(page, 'feeder')
   const scan = page.getByRole('button', { name: 'Feed the stack' })
   await scan.dblclick()
   await expect(page.locator('#job')).toContainText('pages added', { timeout: 15_000 })
@@ -46,17 +52,36 @@ test('double-clicking Scan starts a single job', async ({ page }) => {
 })
 
 test('glass scan from the switch adds one page', async ({ page }) => {
-  await newSession(page, 'Glass')
+  await newSession(page, 'glass')
   await expect(page.getByRole('button', { name: 'Scan the glass' })).toBeVisible()
   await page.getByRole('button', { name: 'Scan the glass' }).click()
   await expect(page.locator('#job')).toContainText('1 page added', { timeout: 15_000 })
   await expect(page.locator('#pages .sheet')).toHaveCount(1)
-  await page.getByRole('button', { name: /Feeder/ }).click()
+  await page.getByRole('button', { name: 'Feeder ScanSnap iX500' }).click()
   await expect(page.getByRole('button', { name: 'Feed the stack' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Scan the glass' })).toBeHidden()
+})
+
+test('each scanner has its own form; a second glass scans into the same session', async ({ page }) => {
+  const errors = watchErrors(page)
+  await newSession(page, 'glass')
+  const glass1 = page.locator('form[data-scanner="glass"]')
+  const glass2 = page.locator('form[data-scanner="glass-2"]')
+  await expect(glass1).toBeVisible()
+  await expect(glass2).toBeHidden()
+  await page.getByRole('button', { name: 'Glass Office AirScan' }).click()
+  await expect(page.getByRole('button', { name: 'Glass Office AirScan' })).toHaveAttribute('aria-pressed', 'true')
+  await expect(page.getByRole('button', { name: 'Glass Epson ET-2750' })).toHaveAttribute('aria-pressed', 'false')
+  await expect(glass1).toBeHidden()
+  await glass2.locator('select[name="dpi"]').selectOption('600')
+  await glass2.getByRole('button', { name: 'Scan the glass' }).click()
+  await expect(page.locator('#job')).toContainText('1 page added', { timeout: 15_000 })
+  await expect(page.locator('#pages .sheet-meta')).toContainText('Office AirScan')
+  expect(errors).toEqual([])
 })
 
 test('page delete needs a second tap', async ({ page }) => {
-  await newSession(page, 'Glass')
+  await newSession(page, 'glass')
   await page.getByRole('button', { name: 'Scan the glass' }).click()
   await expect(page.locator('#pages .sheet')).toHaveCount(1, { timeout: 15_000 })
   await page.getByRole('button', { name: 'Remove page 1', exact: true }).click()
@@ -67,7 +92,7 @@ test('page delete needs a second tap', async ({ page }) => {
 })
 
 test('server errors are swapped into the flash area', async ({ page, request }) => {
-  const path = await newSession(page, 'Glass')
+  const path = await newSession(page, 'glass')
   // Discard the session behind the page's back, then try to scan into it.
   const token = await page.evaluate(() =>
     JSON.parse(document.body.getAttribute('hx-headers:inherited') || '{}')['X-CSRF-Token'],
@@ -91,7 +116,7 @@ test('server errors are swapped into the flash area', async ({ page, request }) 
 test('send goes to the outbox, which polls until filed; back and refresh behave', async ({ page }, info) => {
   // Projects share one demo server: keep titles unique.
   const title = `E2E invoice ${info.project.name}-${Date.now()}`
-  const path = await newSession(page, 'Glass')
+  const path = await newSession(page, 'glass')
   await page.locator('#title').fill(title)
   await page.locator('#title').press('Enter')
   await expect(page.locator('.title-state')).toContainText('Saved')
@@ -115,7 +140,30 @@ test('send goes to the outbox, which polls until filed; back and refresh behave'
 
 test('layout fits a phone screen', async ({ page }, info) => {
   test.skip(info.project.name !== 'mobile', 'mobile only')
-  await newSession(page, 'Feeder')
+  await newSession(page, 'feeder')
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
   expect(overflow).toBeLessThanOrEqual(0)
+})
+
+test('a ScanSnap can be released and taken back from its card', async ({ page }) => {
+  const errors = watchErrors(page)
+  await page.goto('/')
+  const card = page.locator('#status .card[data-scanner="feeder"]')
+  await expect(card.locator('.stamp')).toHaveText('Ready', { timeout: 15_000 })
+  // The cards poll every 5 s and the confirmation stays armed for 4 s: arm it
+  // 2 s after a poll so the next poll falls inside that window.
+  await page.waitForResponse((r) => r.url().endsWith('/fragments/status'))
+  await page.waitForTimeout(2000)
+  await card.getByRole('button', { name: 'Release' }).click()
+  let polls = 0
+  page.on('request', (r) => { if (r.url().endsWith('/fragments/status')) polls++ })
+  await page.waitForTimeout(3800)
+  await expect(card.getByRole('button', { name: 'Tap again to release' })).toBeVisible()
+  expect(polls).toBe(0)
+  await card.getByRole('button', { name: 'Tap again to release' }).click()
+  await expect(card.locator('.stamp')).toHaveText('Released')
+  await expect(card).toContainText('other computers can use it')
+  await card.getByRole('button', { name: 'Take back' }).click()
+  await expect(card.locator('.stamp')).toHaveText('Ready', { timeout: 15_000 })
+  expect(errors).toEqual([])
 })
