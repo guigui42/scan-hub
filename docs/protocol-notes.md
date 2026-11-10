@@ -214,11 +214,16 @@ a dedicated `scanner` user that has only `add_document` and
 | Document | 2 pages, owner `scanner`. Paperless consumption workflows (tags, storage path, custom fields) applied as for any other upload. |
 | Scanner token scope | `GET /api/tasks/` 200; `GET /api/documents/` 403. |
 
-Title sync (added later, not yet checked against the real server) reads
+Title sync (v0.3.0) reads
 `GET /api/documents/?id__in=<ids>&fields=id,title` every 5 minutes and right
 after each delivery. It needs `view_document` on the `scanner` user; with the
-403 above it logs one warning and retries hourly. Paperless only lists
+403 above it logs one warning and retries hourly (seen on the real
+server, 2026-11-10: one `cannot read document titles` warning at start,
+uploads unaffected). Paperless only lists
 documents the user owns, was granted, or that have no owner, so a document
-whose owner changes during triage keeps its last known title. An untitled
+whose owner changes during triage keeps its last known title. The grant is
+broader than it looks: documents with no owner are visible to every user with
+`view_document`. On the test instance (2026-11-10) about 80 % of documents had
+no owner, so the permission was not granted and title sync stays off. An untitled
 upload is named after its file (`scan-<timestamp>-<id>-a<n>`); scan-hub hides
 that name.
