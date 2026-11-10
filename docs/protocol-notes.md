@@ -224,6 +224,6 @@ documents the user owns, was granted, or that have no owner, so a document
 whose owner changes during triage keeps its last known title. The grant is
 broader than it looks: documents with no owner are visible to every user with
 `view_document`. On the test instance (2026-11-10) about 80 % of documents had
-no owner, so the permission was not granted and title sync stays off. An untitled
+no owner; the owner granted the permission anyway, accepting that exposure. An untitled
 upload is named after its file (`scan-<timestamp>-<id>-a<n>`); scan-hub hides
 that name.
