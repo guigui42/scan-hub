@@ -245,6 +245,59 @@ func (c *Client) tasks(ctx context.Context, q url.Values) ([]Task, error) {
 	return list, nil
 }
 
+// ErrForbidden means the token may not read documents (it lacks
+// view_document). Title sync is optional, so callers degrade quietly.
+var ErrForbidden = errors.New("paperless: token may not read documents")
+
+// Titles returns the current title of each document it can see. Documents
+// that are gone or no longer visible to the token are absent from the map.
+func (c *Client) Titles(ctx context.Context, ids []int) (map[int]string, error) {
+	out := make(map[int]string, len(ids))
+	for len(ids) > 0 {
+		n := min(len(ids), 100)
+		chunk := ids[:n]
+		ids = ids[n:]
+		s := make([]string, len(chunk))
+		for i, id := range chunk {
+			s[i] = strconv.Itoa(id)
+		}
+		q := url.Values{"id__in": {strings.Join(s, ",")}, "fields": {"id,title"}, "page_size": {strconv.Itoa(n)}}
+		req, err := c.newRequest(ctx, http.MethodGet, "/api/documents/", q, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.hc.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("paperless documents: %w", err)
+		}
+		b, err := io.ReadAll(io.LimitReader(resp.Body, maxJSONBytes))
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		switch resp.StatusCode {
+		case http.StatusOK:
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return nil, ErrForbidden
+		default:
+			return nil, fmt.Errorf("paperless documents: HTTP %d: %s", resp.StatusCode, snippet(b))
+		}
+		var page struct {
+			Results []struct {
+				ID    int    `json:"id"`
+				Title string `json:"title"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(b, &page); err != nil {
+			return nil, fmt.Errorf("paperless documents: unexpected response: %w", err)
+		}
+		for _, d := range page.Results {
+			out[d.ID] = d.Title
+		}
+	}
+	return out, nil
+}
+
 // Ping checks reachability and the token.
 func (c *Client) Ping(ctx context.Context) error {
 	req, err := c.newRequest(ctx, http.MethodGet, "/api/tasks/", url.Values{"page_size": {"1"}}, nil)

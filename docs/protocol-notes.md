@@ -213,3 +213,12 @@ a dedicated `scanner` user that has only `add_document` and
 | Retry from the outbox UI | New filename `…-a2.pdf`. Task `success` with a `document_id`, marked delivered about 32 s after upload. |
 | Document | 2 pages, owner `scanner`. Paperless consumption workflows (tags, storage path, custom fields) applied as for any other upload. |
 | Scanner token scope | `GET /api/tasks/` 200; `GET /api/documents/` 403. |
+
+Title sync (added later, not yet checked against the real server) reads
+`GET /api/documents/?id__in=<ids>&fields=id,title` every 5 minutes and right
+after each delivery. It needs `view_document` on the `scanner` user; with the
+403 above it logs one warning and retries hourly. Paperless only lists
+documents the user owns, was granted, or that have no owner, so a document
+whose owner changes during triage keeps its last known title. An untitled
+upload is named after its file (`scan-<timestamp>-<id>-a<n>`); scan-hub hides
+that name.
