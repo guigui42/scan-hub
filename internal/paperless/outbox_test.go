@@ -349,9 +349,16 @@ func TestTitlesForbiddenIsQuiet(t *testing.T) {
 	e.fake.Set(func(s *paperlesstest.Server) { s.ForbidDocuments = true })
 	it := enqueue(t, e.ob, "Sent title")
 	wait(t, e.ob, it.ID, paperless.StateSuccess)
-	it2 := enqueue(t, e.ob, "")
-	wait(t, e.ob, it2.ID, paperless.StateSuccess)
 	time.Sleep(60 * time.Millisecond)
+	before := e.fake.DocumentRequests()
+	for range 3 {
+		it2 := enqueue(t, e.ob, "")
+		wait(t, e.ob, it2.ID, paperless.StateSuccess)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if n := e.fake.DocumentRequests(); n != before {
+		t.Fatalf("deliveries bypassed the forbidden backoff: %d more requests", n-before)
+	}
 	got, _ := e.ob.Get(it.ID)
 	if got.PaperlessTitle != "" || got.DisplayTitle() != "Sent title" {
 		t.Fatalf("%+v", got)
@@ -374,8 +381,20 @@ func TestTitlesClient(t *testing.T) {
 	if err != nil || len(got) != 250 || got[250] != "doc 250" {
 		t.Fatalf("%d titles, err %v", len(got), err)
 	}
-	fake.Set(func(s *paperlesstest.Server) { s.ForbidDocuments = true })
+	// A failing later request keeps the titles already read.
+	done := fake.DocumentRequests()
+	fake.Set(func(s *paperlesstest.Server) { s.FailDocumentsAfter = done + 1 })
+	got, err = c.Titles(context.Background(), ids)
+	if err == nil || len(got) != 100 {
+		t.Fatalf("partial: %d titles, err %v", len(got), err)
+	}
+	fake.Set(func(s *paperlesstest.Server) { s.FailDocumentsAfter, s.ForbidDocuments = 0, true })
 	if _, err := c.Titles(context.Background(), ids[:1]); !errors.Is(err, paperless.ErrForbidden) {
 		t.Fatalf("want ErrForbidden, got %v", err)
+	}
+	// A bad token is not a missing permission.
+	bad, _ := paperless.NewClient(fake.URL, "wrong", nil)
+	if _, err := bad.Titles(context.Background(), ids[:1]); err == nil || errors.Is(err, paperless.ErrForbidden) {
+		t.Fatalf("401: got %v", err)
 	}
 }

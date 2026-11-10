@@ -245,12 +245,13 @@ func (c *Client) tasks(ctx context.Context, q url.Values) ([]Task, error) {
 	return list, nil
 }
 
-// ErrForbidden means the token may not read documents (it lacks
+// ErrForbidden means the token may not read documents (HTTP 403: it lacks
 // view_document). Title sync is optional, so callers degrade quietly.
 var ErrForbidden = errors.New("paperless: token may not read documents")
 
 // Titles returns the current title of each document it can see. Documents
 // that are gone or no longer visible to the token are absent from the map.
+// On error, the map still holds the titles of the requests that succeeded.
 func (c *Client) Titles(ctx context.Context, ids []int) (map[int]string, error) {
 	out := make(map[int]string, len(ids))
 	for len(ids) > 0 {
@@ -264,23 +265,23 @@ func (c *Client) Titles(ctx context.Context, ids []int) (map[int]string, error) 
 		q := url.Values{"id__in": {strings.Join(s, ",")}, "fields": {"id,title"}, "page_size": {strconv.Itoa(n)}}
 		req, err := c.newRequest(ctx, http.MethodGet, "/api/documents/", q, nil)
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 		resp, err := c.hc.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("paperless documents: %w", err)
+			return out, fmt.Errorf("paperless documents: %w", err)
 		}
 		b, err := io.ReadAll(io.LimitReader(resp.Body, maxJSONBytes))
 		resp.Body.Close()
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 		switch resp.StatusCode {
 		case http.StatusOK:
-		case http.StatusUnauthorized, http.StatusForbidden:
-			return nil, ErrForbidden
-		default:
-			return nil, fmt.Errorf("paperless documents: HTTP %d: %s", resp.StatusCode, snippet(b))
+		case http.StatusForbidden:
+			return out, ErrForbidden
+		default: // 401 is a bad token: uploads report it already
+			return out, fmt.Errorf("paperless documents: HTTP %d: %s", resp.StatusCode, snippet(b))
 		}
 		var page struct {
 			Results []struct {
@@ -289,7 +290,7 @@ func (c *Client) Titles(ctx context.Context, ids []int) (map[int]string, error) 
 			} `json:"results"`
 		}
 		if err := json.Unmarshal(b, &page); err != nil {
-			return nil, fmt.Errorf("paperless documents: unexpected response: %w", err)
+			return out, fmt.Errorf("paperless documents: unexpected response: %w", err)
 		}
 		for _, d := range page.Results {
 			out[d.ID] = d.Title

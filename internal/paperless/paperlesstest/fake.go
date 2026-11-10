@@ -59,7 +59,11 @@ type Server struct {
 	// ForbidDocuments answers 403 on /api/documents/, like a token without
 	// view_document.
 	ForbidDocuments bool
-	docs            map[int]string // document id -> title
+	// FailDocumentsAfter makes /api/documents/ answer 500 after this many
+	// successful requests (0: never).
+	FailDocumentsAfter int
+	docRequests        int
+	docs               map[int]string // document id -> title
 }
 
 // Start launches the fake (plain HTTP).
@@ -191,6 +195,11 @@ func (s *Server) render(t *task) map[string]any {
 func (s *Server) listDocuments(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.docRequests++
+	if s.FailDocumentsAfter > 0 && s.docRequests > s.FailDocumentsAfter {
+		http.Error(w, "boom", http.StatusInternalServerError)
+		return
+	}
 	if s.ForbidDocuments {
 		http.Error(w, `{"detail":"You do not have permission to perform this action."}`, http.StatusForbidden)
 		return
@@ -207,6 +216,13 @@ func (s *Server) listDocuments(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"count": len(out), "next": nil, "previous": nil, "results": out})
+}
+
+// DocumentRequests counts calls to /api/documents/.
+func (s *Server) DocumentRequests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.docRequests
 }
 
 // SetTitle renames a document, as triage in Paperless would.
