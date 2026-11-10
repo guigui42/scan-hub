@@ -27,7 +27,9 @@ Three screens:
   even across restarts, until you tap **Take back**.
 - **Session:** scan with any configured scanner, preview and delete pages,
   title the document, and send it.
-- **Outbox:** follow delivery; retry or discard failed documents.
+- **Outbox:** follow delivery; retry or discard failed documents. Filed
+  documents link to Paperless and show their current Paperless title (needs
+  `view_document`, see below).
 
 How it's built:
 
@@ -94,7 +96,7 @@ server, so scan them from the UI or their Scan button.
 | `SCANHUB_MIN_FREE_MB` | `512` | Refuse new pages below this much free disk space (`0` disables) |
 | `SCANHUB_SCANNERS_FILE` | empty (no scanners) | Absolute path of the scanner list (YAML, see below) |
 | `SCANHUB_PAPERLESS_URL` | empty (disabled) | Paperless base URL, e.g. `https://paperless.example.com` |
-| `SCANHUB_PAPERLESS_TOKEN` / `_FILE` | none | API token of a dedicated Paperless user that has only the `add_document` and `view_paperlesstask` permissions; required with the URL |
+| `SCANHUB_PAPERLESS_TOKEN` / `_FILE` | none | API token of a dedicated Paperless user that has only the `add_document` and `view_paperlesstask` permissions; required with the URL. Optionally add `view_document`: scan-hub then shows each filed document's current Paperless title (e.g. after triage renames it), at the cost of the token being able to read the documents that user owns. |
 | `SCANHUB_PAPERLESS_TAGS` | none | Comma-separated tag IDs added to every upload |
 | `SCANHUB_OUTBOX_MAX_MB` | `2048` | Maximum size of PDFs waiting in the outbox |
 

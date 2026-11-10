@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,7 @@ type task struct {
 	filename string
 	created  time.Time
 	polls    int
+	title    string
 	outcome  Outcome
 	docID    int
 }
@@ -54,14 +56,23 @@ type Server struct {
 	PendingFor  int     // polls answered "started" before the outcome
 	FailUploads int     // next N uploads answer 503 without consuming
 	DropAfter   int     // next N uploads are consumed, then the connection is cut
+	// ForbidDocuments answers 403 on /api/documents/, like a token without
+	// view_document.
+	ForbidDocuments bool
+	// FailDocumentsAfter makes /api/documents/ answer 500 after this many
+	// successful requests (0: never).
+	FailDocumentsAfter int
+	docRequests        int
+	docs               map[int]string // document id -> title
 }
 
 // Start launches the fake (plain HTTP).
 func Start(token string) *Server {
-	s := &Server{Token: token, tasks: map[string]*task{}, nextDoc: 100}
+	s := &Server{Token: token, tasks: map[string]*task{}, nextDoc: 100, docs: map[int]string{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/documents/post_document/", s.postDocument)
 	mux.HandleFunc("GET /api/tasks/", s.listTasks)
+	mux.HandleFunc("GET /api/documents/", s.listDocuments)
 	s.Server = httptest.NewServer(s.auth(mux))
 	return s
 }
@@ -107,7 +118,7 @@ func (s *Server) postDocument(w http.ResponseWriter, r *http.Request) {
 	rand.Read(b[:])
 	id := hex.EncodeToString(b[:])
 	s.uploads = append(s.uploads, Upload{Filename: fh.Filename, Title: r.FormValue("title"), Tags: r.Form["tags"], Body: body, TaskID: id})
-	s.tasks[id] = &task{id: id, filename: fh.Filename, created: time.Now(), outcome: s.Next}
+	s.tasks[id] = &task{id: id, filename: fh.Filename, title: r.FormValue("title"), created: time.Now(), outcome: s.Next}
 	drop := s.DropAfter > 0
 	if drop {
 		s.DropAfter--
@@ -163,6 +174,12 @@ func (s *Server) render(t *task) map[string]any {
 		if t.docID == 0 {
 			s.nextDoc++
 			t.docID = s.nextDoc
+			// Like Paperless: without a title, the file name becomes one.
+			title := t.title
+			if title == "" {
+				title = strings.TrimSuffix(t.filename, ".pdf")
+			}
+			s.docs[t.docID] = title
 		}
 		m["status"], m["result_data"] = "success", map[string]any{"document_id": t.docID}
 	case Duplicate:
@@ -173,6 +190,53 @@ func (s *Server) render(t *task) map[string]any {
 		m["status"], m["result_data"] = "success", map[string]any{"reason": "Barcode splitting complete"}
 	}
 	return m
+}
+
+func (s *Server) listDocuments(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.docRequests++
+	if s.FailDocumentsAfter > 0 && s.docRequests > s.FailDocumentsAfter {
+		http.Error(w, "boom", http.StatusInternalServerError)
+		return
+	}
+	if s.ForbidDocuments {
+		http.Error(w, `{"detail":"You do not have permission to perform this action."}`, http.StatusForbidden)
+		return
+	}
+	var out []map[string]any
+	for _, v := range strings.Split(r.URL.Query().Get("id__in"), ",") {
+		id, err := strconv.Atoi(v)
+		if err != nil {
+			continue
+		}
+		if title, ok := s.docs[id]; ok {
+			out = append(out, map[string]any{"id": id, "title": title})
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"count": len(out), "next": nil, "previous": nil, "results": out})
+}
+
+// DocumentRequests counts calls to /api/documents/.
+func (s *Server) DocumentRequests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.docRequests
+}
+
+// SetTitle renames a document, as triage in Paperless would.
+func (s *Server) SetTitle(docID int, title string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.docs[docID] = title
+}
+
+// DeleteDocument removes a document (or hides it from the token).
+func (s *Server) DeleteDocument(docID int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.docs, docID)
 }
 
 // Uploads returns what was received.

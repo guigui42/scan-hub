@@ -1,6 +1,7 @@
 package paperless
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -46,7 +47,11 @@ var (
 	ErrState = errors.New("not allowed in this state")
 )
 
-var idPattern = regexp.MustCompile(`^[0-9a-f]{16}$`)
+var (
+	idPattern = regexp.MustCompile(`^[0-9a-f]{16}$`)
+	// defaultTitle is what Paperless calls an untitled upload: our file name.
+	defaultTitle = regexp.MustCompile(`^scan-\d{8}-\d{6}-[0-9a-f]{16}-a\d+$`)
+)
 
 // Item is one PDF on its way to Paperless.
 type Item struct {
@@ -66,6 +71,21 @@ type Item struct {
 	DocumentID  int       `json:"document_id,omitempty"`
 	DuplicateOf int       `json:"duplicate_of,omitempty"`
 	Detail      string    `json:"detail,omitempty"`
+	// PaperlessTitle is the document's current title in Paperless, which
+	// triage may have changed since the upload.
+	PaperlessTitle string `json:"paperless_title,omitempty"`
+}
+
+// DocID is the Paperless document that holds this item, if known.
+func (it Item) DocID() int { return cmp.Or(it.DocumentID, it.DuplicateOf) }
+
+// DisplayTitle is the title Paperless shows now, unless Paperless only
+// derived it from the upload file name; then it is the title we sent.
+func (it Item) DisplayTitle() string {
+	if t := it.PaperlessTitle; t != "" && !defaultTitle.MatchString(t) {
+		return t
+	}
+	return it.Title
 }
 
 // Filename is the upload name for the current attempt. It is unique per
@@ -87,6 +107,7 @@ type Options struct {
 	UncertainGrace time.Duration // how long a lost upload may take to appear, default 60 s
 	UploadTimeout  time.Duration // default 10 min
 	HistoryMaxAge  time.Duration // keep finished items this long, default 30 days
+	TitleRefresh   time.Duration // re-read titles of delivered items, default 5 min; negative disables
 	Logger         *slog.Logger
 }
 
@@ -109,6 +130,7 @@ func (o *Options) defaults() {
 	d(&o.UncertainGrace, time.Minute)
 	d(&o.UploadTimeout, 10*time.Minute)
 	d(&o.HistoryMaxAge, 30*24*time.Hour)
+	d(&o.TitleRefresh, 5*time.Minute)
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
@@ -124,6 +146,12 @@ type Outbox struct {
 	free   func(string) (int64, error)
 
 	lock *os.File
+
+	// Owned by the Run goroutine.
+	nextTitles      time.Time
+	titlesForbidden bool
+	titlesBusy      bool
+	titles          chan titlesResult
 
 	mu    sync.Mutex
 	items map[string]Item
@@ -150,6 +178,7 @@ func Open(client *Client, opt Options) (*Outbox, error) {
 	o := &Outbox{
 		opt: opt, client: client, log: opt.Logger.With("component", "outbox"),
 		kick: make(chan struct{}, 1), free: freeBytes, items: map[string]Item{}, lock: lock,
+		titles: make(chan titlesResult, 1),
 	}
 	ok := false
 	defer func() {
@@ -341,6 +370,8 @@ func (o *Outbox) Discard(id string) error {
 
 // Run uploads and tracks items until ctx is cancelled.
 func (o *Outbox) Run(ctx context.Context) {
+	var fetches sync.WaitGroup
+	defer fetches.Wait()
 	for {
 		now := time.Now().UTC()
 		for _, it := range o.due(now) {
@@ -348,6 +379,9 @@ func (o *Outbox) Run(ctx context.Context) {
 				return
 			}
 			o.step(ctx, it)
+		}
+		if o.opt.TitleRefresh > 0 && !o.titlesBusy && !now.Before(o.nextTitles) {
+			o.fetchTitles(ctx, &fetches)
 		}
 		o.prune(now)
 		wait := o.untilNext(time.Now().UTC())
@@ -358,6 +392,9 @@ func (o *Outbox) Run(ctx context.Context) {
 			return
 		case <-o.kick:
 		case <-t.C:
+		case r := <-o.titles:
+			o.titlesBusy = false
+			o.applyTitles(r)
 		}
 		t.Stop()
 	}
@@ -390,6 +427,9 @@ func (o *Outbox) untilNext(now time.Time) time.Duration {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	next := 30 * time.Second
+	if o.opt.TitleRefresh > 0 && !o.titlesBusy {
+		next = min(next, max(o.nextTitles.Sub(now), 10*time.Millisecond))
+	}
 	for _, it := range o.items {
 		switch it.State {
 		case StatePending, StateUncertain, StateAccepted:
@@ -531,6 +571,9 @@ func (o *Outbox) finish(it Item, st State, detail string) {
 		o.log.Warn("delete sent PDF", "id", it.ID, "err", err)
 	}
 	fsutil.SyncDir(o.opt.Dir)
+	if !o.titlesForbidden {
+		o.nextTitles = time.Time{} // pick up the title Paperless gave it
+	}
 	o.log.Info("delivered", "id", it.ID, "state", st, "document", it.DocumentID, "duplicate_of", it.DuplicateOf)
 }
 
@@ -539,6 +582,75 @@ func (o *Outbox) transition(it Item, st State, detail string) {
 	it.State, it.Since, it.Detail, it.NextAttempt = st, now, detail, time.Time{}
 	if err := o.update(it); err != nil {
 		o.log.Error("persist outbox item", "id", it.ID, "err", err)
+	}
+}
+
+type titlesResult struct {
+	titles map[int]string
+	err    error
+}
+
+// fetchTitles reads the current Paperless title of delivered items in the
+// background, so a slow Paperless never holds up uploads. Run applies the
+// result. Reading titles needs the view_document permission.
+func (o *Outbox) fetchTitles(ctx context.Context, wg *sync.WaitGroup) {
+	o.nextTitles = time.Now().UTC().Add(o.opt.TitleRefresh)
+	var ids []int
+	o.mu.Lock()
+	for _, it := range o.items {
+		if id := it.DocID(); it.State.Done() && id > 0 && !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	o.mu.Unlock()
+	if len(ids) == 0 {
+		return
+	}
+	slices.Sort(ids)
+	o.titlesBusy = true
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// 15 s per request of up to 100 documents.
+		c, cancel := context.WithTimeout(ctx, time.Duration((len(ids)+99)/100)*15*time.Second)
+		defer cancel()
+		titles, err := o.client.Titles(c, ids)
+		o.titles <- titlesResult{titles, err}
+	}()
+}
+
+// applyTitles stores titles that changed, so documents renamed during
+// triage show their new name. Documents Paperless didn't return (deleted,
+// or no longer visible to the token) keep their last known title.
+func (o *Outbox) applyTitles(r titlesResult) {
+	switch {
+	case errors.Is(r.err, ErrForbidden):
+		if !o.titlesForbidden {
+			o.log.Warn("cannot read document titles; grant view_document to the Paperless user to show titles changed in Paperless")
+			o.titlesForbidden = true
+		}
+		o.nextTitles = time.Now().UTC().Add(max(o.opt.TitleRefresh, time.Hour))
+		return
+	case r.err != nil:
+		o.log.Debug("refresh titles", "err", r.err, "partial", len(r.titles))
+	case o.titlesForbidden:
+		o.log.Info("document titles readable again")
+		o.titlesForbidden = false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for id, it := range o.items {
+		t, ok := r.titles[it.DocID()]
+		if !it.State.Done() || !ok || t == it.PaperlessTitle {
+			continue
+		}
+		it.PaperlessTitle = t
+		// Not saveLocked: a rename must not extend the item's history.
+		if err := o.save(it); err != nil {
+			o.log.Error("persist title", "id", id, "err", err)
+			continue
+		}
+		o.items[id] = it
 	}
 }
 

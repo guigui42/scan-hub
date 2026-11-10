@@ -114,11 +114,11 @@
   {{range .Items}}
   <li class="entry entry-{{stamp .State}}">
     <div class="entry-main">
-      <p class="entry-title">{{if .Title}}{{.Title}}{{else}}Untitled scan{{end}}</p>
+      <p class="entry-title">{{with .DisplayTitle}}{{.}}{{else}}Untitled scan{{end}}</p>
       <p class="entry-meta">{{.Pages}} p · {{bytes .Size}} · {{sourceLabel .Source}} · {{ago .Created}}</p>
       {{with .Detail}}<p class="entry-detail">{{.}}</p>{{end}}
     </div>
-    <p class="stamp stamp-{{stamp .State}}">{{stateLabel .State}}{{$doc := or .DocumentID .DuplicateOf}}{{if $doc}} {{with docURL $doc}}<a href="{{.}}" target="_blank" rel="noopener">#{{$doc}}</a>{{else}}#{{$doc}}{{end}}{{end}}</p>
+    <p class="stamp stamp-{{stamp .State}}">{{stateLabel .State}}{{$doc := .DocID}}{{if $doc}} {{with docURL $doc}}<a href="{{.}}" target="_blank" rel="noopener">#{{$doc}}</a>{{else}}#{{$doc}}{{end}}{{end}}</p>
     {{if isFailure .State}}
     <div class="entry-actions">
       <a class="link-btn" href="/outbox/{{.ID}}/pdf" target="_blank" rel="noopener">View PDF</a>
@@ -159,10 +159,10 @@
     {{range .}}
     <li class="entry entry-{{stamp .State}}">
       <div class="entry-main">
-        <p class="entry-title">{{if .Title}}{{.Title}}{{else}}Untitled scan{{end}}</p>
+        <p class="entry-title">{{with .DisplayTitle}}{{.}}{{else}}Untitled scan{{end}}</p>
         <p class="entry-meta">{{.Pages}} p · {{sourceLabel .Source}} · {{ago .Created}}</p>
       </div>
-      <p class="stamp stamp-{{stamp .State}}">{{stateLabel .State}}</p>
+      <p class="stamp stamp-{{stamp .State}}">{{stateLabel .State}}{{$doc := .DocID}}{{if $doc}} {{with docURL $doc}}<a href="{{.}}" target="_blank" rel="noopener">#{{$doc}}</a>{{else}}#{{$doc}}{{end}}{{end}}</p>
     </li>
     {{end}}
   </ol>

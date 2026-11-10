@@ -81,7 +81,7 @@ func newRig(t *testing.T) *rig {
 	pl := paperlesstest.Start("tok")
 	pc, _ := paperless.NewClient(pl.URL, "tok", nil)
 	ob, err := paperless.Open(pc, paperless.Options{Dir: filepath.Join(dir, "outbox"), MinFreeBytes: -1,
-		PollMin: 10 * time.Millisecond, PollMax: 20 * time.Millisecond, Logger: log})
+		PollMin: 10 * time.Millisecond, PollMax: 20 * time.Millisecond, TitleRefresh: 10 * time.Millisecond, Logger: log})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,6 +308,24 @@ func TestDeskScanSendFlow(t *testing.T) {
 	}
 	if strings.Contains(body, "Facture <EDF>") {
 		t.Fatal("title not escaped")
+	}
+
+	// Renamed during triage in Paperless: the home page follows, with a link.
+	r.pl.SetTitle(101, "EDF <novembre>")
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if r.ob.List()[0].PaperlessTitle == "EDF <novembre>" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("title not refreshed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, body, _ = r.get("/")
+	recent := body[strings.Index(body, "Recently sent"):]
+	if !strings.Contains(recent, "EDF &lt;novembre&gt;") || !strings.Contains(recent, `href="https://paperless.example/documents/101/details"`) {
+		t.Fatalf("home page:\n%s", recent)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -285,5 +286,115 @@ func TestSecondOpenIsRefused(t *testing.T) {
 	c, _ := paperless.NewClient(e.fake.URL, token, nil)
 	if _, err := paperless.Open(c, paperless.Options{Dir: e.dir}); !errors.Is(err, paperless.ErrLocked) {
 		t.Fatalf("want ErrLocked, got %v", err)
+	}
+}
+
+func waitTitle(t *testing.T, ob *paperless.Outbox, id, want string) paperless.Item {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var it paperless.Item
+	for time.Now().Before(deadline) {
+		it, _ = ob.Get(id)
+		if it.PaperlessTitle == want {
+			return it
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("item %s: Paperless title %q, want %q", id, it.PaperlessTitle, want)
+	return it
+}
+
+func TestTitleFollowsPaperless(t *testing.T) {
+	e := setup(t, paperless.Options{TitleRefresh: 10 * time.Millisecond}, nil)
+	it := enqueue(t, e.ob, "")
+	doc := wait(t, e.ob, it.ID, paperless.StateSuccess).DocumentID
+
+	// Untitled upload: Paperless names it after the file, which we hide.
+	got := waitTitle(t, e.ob, it.ID, strings.TrimSuffix(it.Filename(), ".pdf"))
+	if got.DisplayTitle() != "" {
+		t.Fatalf("default title shown: %q", got.DisplayTitle())
+	}
+
+	e.fake.SetTitle(doc, "Facture EDF")
+	got = waitTitle(t, e.ob, it.ID, "Facture EDF")
+	if got.DisplayTitle() != "Facture EDF" || got.Updated != wait(t, e.ob, it.ID, paperless.StateSuccess).Updated {
+		t.Fatalf("%+v", got)
+	}
+	b, err := os.ReadFile(filepath.Join(e.dir, it.ID+".json"))
+	if err != nil || !strings.Contains(string(b), `"paperless_title": "Facture EDF"`) {
+		t.Fatalf("title not persisted: %s %v", b, err)
+	}
+
+	// Gone from Paperless (or no longer visible): keep the last known title.
+	e.fake.DeleteDocument(doc)
+	time.Sleep(60 * time.Millisecond)
+	if got, _ := e.ob.Get(it.ID); got.PaperlessTitle != "Facture EDF" {
+		t.Fatalf("title lost: %q", got.PaperlessTitle)
+	}
+}
+
+func TestDuplicateTakesExistingTitle(t *testing.T) {
+	e := setup(t, paperless.Options{TitleRefresh: 10 * time.Millisecond}, nil)
+	e.fake.SetTitle(42, "Contrat")
+	e.fake.Set(func(s *paperlesstest.Server) { s.Next = paperlesstest.Duplicate })
+	it := enqueue(t, e.ob, "")
+	wait(t, e.ob, it.ID, paperless.StateDuplicate)
+	if got := waitTitle(t, e.ob, it.ID, "Contrat"); got.DisplayTitle() != "Contrat" {
+		t.Fatalf("%+v", got)
+	}
+}
+
+func TestTitlesForbiddenIsQuiet(t *testing.T) {
+	e := setup(t, paperless.Options{TitleRefresh: 10 * time.Millisecond}, nil)
+	e.fake.Set(func(s *paperlesstest.Server) { s.ForbidDocuments = true })
+	it := enqueue(t, e.ob, "Sent title")
+	wait(t, e.ob, it.ID, paperless.StateSuccess)
+	time.Sleep(60 * time.Millisecond)
+	before := e.fake.DocumentRequests()
+	for range 3 {
+		it2 := enqueue(t, e.ob, "")
+		wait(t, e.ob, it2.ID, paperless.StateSuccess)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if n := e.fake.DocumentRequests(); n != before {
+		t.Fatalf("deliveries bypassed the forbidden backoff: %d more requests", n-before)
+	}
+	got, _ := e.ob.Get(it.ID)
+	if got.PaperlessTitle != "" || got.DisplayTitle() != "Sent title" {
+		t.Fatalf("%+v", got)
+	}
+	if n := strings.Count(e.logs.String(), "grant view_document"); n != 1 {
+		t.Fatalf("forbidden warning logged %d times:\n%s", n, e.logs.String())
+	}
+}
+
+func TestTitlesClient(t *testing.T) {
+	fake := paperlesstest.Start(token)
+	defer fake.Close()
+	ids := make([]int, 250)
+	for i := range ids {
+		ids[i] = i + 1
+		fake.SetTitle(i+1, fmt.Sprintf("doc %d", i+1))
+	}
+	c, _ := paperless.NewClient(fake.URL, token, nil)
+	got, err := c.Titles(context.Background(), append(ids, 999))
+	if err != nil || len(got) != 250 || got[250] != "doc 250" {
+		t.Fatalf("%d titles, err %v", len(got), err)
+	}
+	// A failing later request keeps the titles already read.
+	done := fake.DocumentRequests()
+	fake.Set(func(s *paperlesstest.Server) { s.FailDocumentsAfter = done + 1 })
+	got, err = c.Titles(context.Background(), ids)
+	if err == nil || len(got) != 100 {
+		t.Fatalf("partial: %d titles, err %v", len(got), err)
+	}
+	fake.Set(func(s *paperlesstest.Server) { s.FailDocumentsAfter, s.ForbidDocuments = 0, true })
+	if _, err := c.Titles(context.Background(), ids[:1]); !errors.Is(err, paperless.ErrForbidden) {
+		t.Fatalf("want ErrForbidden, got %v", err)
+	}
+	// A bad token is not a missing permission.
+	bad, _ := paperless.NewClient(fake.URL, "wrong", nil)
+	if _, err := bad.Titles(context.Background(), ids[:1]); err == nil || errors.Is(err, paperless.ErrForbidden) {
+		t.Fatalf("401: got %v", err)
 	}
 }
