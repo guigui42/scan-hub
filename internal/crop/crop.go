@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"math"
 	"slices"
 )
 
@@ -44,6 +45,7 @@ const (
 	dustMM    = 2.0 // marks spanning less than this (dust, specks) are ignored
 	blobGapMM = 1.0 // marks closer than this belong together (letters, strokes)
 	keepFrac  = 0.9 // a crop keeping more than this of the page isn't worth it
+	localMM   = 3   // the background is judged within this distance
 )
 
 // Detect finds the content on a light background (the scanner lid) and
@@ -51,6 +53,37 @@ const (
 // millimetres to pixels (0 means 300). ok is false when there is nothing to
 // trim: a blank page, or content covering most of it.
 func Detect(img image.Image, dpi int) (r Rect, ok bool) {
+	return detect(img, dpi, nil)
+}
+
+// DetectTurned is Detect on view, a w×h scan turned by r (see Rotate). It
+// looks only at the scanned area: the corners the turn uncovered, and the
+// border of the original scan, are neither content nor background.
+func DetectTurned(view image.Image, dpi int, r Rotation, w, h int) (Rect, bool) {
+	if dpi <= 0 {
+		dpi = 300
+	}
+	if math.Abs(r.Angle) < minAngle {
+		return detect(view, dpi, nil)
+	}
+	if r.Turns%2 == 1 {
+		w, h = h, w
+	}
+	vb := view.Bounds()
+	cx, cy := float64(vb.Dx())/2, float64(vb.Dy())/2
+	rad := r.Angle * math.Pi / 180
+	sin, cos := math.Sin(rad), math.Cos(rad)
+	margin := edgeMM*float64(dpi)/25.4 + 1
+	return detect(view, dpi, func(x, y float64) bool {
+		// Back through the turn to the scan as it came off the glass.
+		dx, dy := x-cx, y-cy
+		sx, sy := cos*dx+sin*dy+float64(w)/2, -sin*dx+cos*dy+float64(h)/2
+		return sx >= margin && sy >= margin && sx <= float64(w)-margin && sy <= float64(h)-margin
+	})
+}
+
+// detect is Detect, minding only the pixels where scanned (nil: all).
+func detect(img image.Image, dpi int, scanned func(x, y float64) bool) (r Rect, ok bool) {
 	if dpi <= 0 {
 		dpi = 300
 	}
@@ -85,11 +118,38 @@ func Detect(img image.Image, dpi int) (r Rect, ok bool) {
 			mean[gy*gw+gx] = uint8(sum[gy*gw+gx] / n)
 		}
 	}
-	// The background is the light end of the histogram.
-	sorted := slices.Clone(mean)
+	// A cell counts when all of it was scanned.
+	in := make([]bool, gw*gh)
+	var sorted []uint8
+	for gy := range gh {
+		for gx := range gw {
+			x0, y0 := float64(gx*step), float64(gy*step)
+			x1, y1 := float64(min(W, (gx+1)*step)), float64(min(H, (gy+1)*step))
+			i := gy*gw + gx
+			in[i] = scanned == nil || (scanned(x0, y0) && scanned(x1, y0) && scanned(x0, y1) && scanned(x1, y1))
+			if in[i] {
+				sorted = append(sorted, mean[i])
+			}
+		}
+	}
+	if len(sorted) == 0 {
+		return Rect{}, false
+	}
+	// The background is the light end of the histogram, nearby: a lid
+	// that let light in shades the glass smoothly over centimetres, while
+	// a document's edges and print stand out from what's around them.
 	slices.Sort(sorted)
 	bg := int(sorted[len(sorted)*95/100])
-	content := func(i int) bool { return int(dark[i]) < bg-darkStep || spread[i] > chroma }
+	lit := make([]uint8, gw*gh)
+	for i := range lit {
+		if in[i] {
+			lit[i] = mean[i]
+		}
+	}
+	local := windowMax(lit, gw, gh, max(1, int(localMM*float64(dpi)/25.4)/step))
+	content := func(i int) bool {
+		return in[i] && (int(dark[i]) < min(bg, int(local[i]))-darkStep || spread[i] > chroma)
+	}
 
 	px := func(mm float64) int { return int(mm * float64(dpi) / 25.4) }
 	edge := max(1, px(edgeMM)/step)
@@ -125,6 +185,32 @@ func Detect(img image.Image, dpi int) (r Rect, ok bool) {
 		return Rect{}, false
 	}
 	return r, true
+}
+
+// windowMax returns, for each cell of a w×h grid, the largest value within
+// r cells either way.
+func windowMax(v []uint8, w, h, r int) []uint8 {
+	rows := make([]uint8, len(v))
+	for y := range h {
+		for x := range w {
+			m := uint8(0)
+			for k := max(0, x-r); k <= min(w-1, x+r); k++ {
+				m = max(m, v[y*w+k])
+			}
+			rows[y*w+x] = m
+		}
+	}
+	out := make([]uint8, len(v))
+	for x := range w {
+		for y := range h {
+			m := uint8(0)
+			for k := max(0, y-r); k <= min(h-1, y+r); k++ {
+				m = max(m, rows[k*w+x])
+			}
+			out[y*w+x] = m
+		}
+	}
+	return out
 }
 
 // blobs groups content cells (inside the ignored border) into clusters of

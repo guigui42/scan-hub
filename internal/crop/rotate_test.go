@@ -3,6 +3,7 @@ package crop
 import (
 	"image"
 	"image/color"
+	"image/draw"
 	"math"
 	"testing"
 )
@@ -91,5 +92,30 @@ func TestRotateAngleKeepsWholePage(t *testing.T) {
 	x, y := float64(w)/2+(1169/2-10)*s, float64(h)/2-(1169/2-10)*c
 	if r, _, _, _ := out.At(int(x), int(y)).RGBA(); r>>8 > 60 {
 		t.Error("top edge lost")
+	}
+}
+
+// Glass scans have a grey lid; the white a turn uncovers must not make the
+// lid look like content, or the crop keeps the whole tilted glass.
+func TestDetectTurnedIgnoresUncoveredCorners(t *testing.T) {
+	img := a4()
+	fill(img, img.Bounds(), color.RGBA{215, 215, 212, 255}) // grey lid
+	card := image.NewRGBA(image.Rect(0, 0, 337, 213))
+	fill(card, card.Bounds(), color.RGBA{240, 236, 226, 255})
+	fill(card, image.Rect(20, 40, 110, 170), color.RGBA{90, 78, 70, 255})
+	for i := range 6 {
+		fill(card, image.Rect(130, 50+i*20, 310-i*15, 58+i*20), color.RGBA{40, 50, 80, 255})
+	}
+	tilted := Rotate(card, Rotation{Angle: 4})
+	draw.Draw(img, tilted.Bounds().Add(image.Pt(200, 300)), tilted, image.Point{}, draw.Src)
+
+	r := Rotation{Angle: -4}
+	view := Rotate(img, r)
+	got, ok := DetectTurned(view, 100, r, 827, 1169)
+	if !ok || got.W > 337+2*11+20 || got.H > 213+2*11+20 {
+		t.Fatalf("crop %+v, %v; want at most the card, about 359x235", got, ok)
+	}
+	if plain, ok := Detect(view, 100); ok && plain.W < 600 {
+		t.Fatalf("plain Detect %+v already copes: this test guards nothing", plain)
 	}
 }

@@ -340,7 +340,7 @@ func (s *Store) Detect(id, file string, rot crop.Rotation, straighten bool) (m M
 	}
 	view := crop.Rotate(img, rot)
 	var c *crop.Rect
-	if r, trimmed := crop.Detect(view, p.DPI); trimmed {
+	if r, trimmed := crop.DetectTurned(view, p.DPI, rot, img.Bounds().Dx(), img.Bounds().Dy()); trimmed {
 		c = &r
 	}
 	if c == nil && (!straighten || rot.Angle == 0) {
