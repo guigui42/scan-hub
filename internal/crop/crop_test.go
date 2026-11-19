@@ -4,6 +4,7 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"math"
 	"testing"
 )
 
@@ -58,6 +59,22 @@ func TestDetectCardInCornerIgnoresGlassEdge(t *testing.T) {
 	}
 }
 
+// A thin rule far below the text must survive, even at 600 dpi where cells
+// are 12 px apart.
+func TestDetectKeepsThinContent(t *testing.T) {
+	img := image.NewGray(image.Rect(0, 0, 4960, 7016)) // A4 at 600 dpi
+	draw.Draw(img, img.Bounds(), image.White, image.Point{}, draw.Src)
+	draw.Draw(img, image.Rect(600, 600, 4000, 3000), image.Black, image.Point{}, draw.Src)
+	draw.Draw(img, image.Rect(1000, 4201, 3000, 4203), image.Black, image.Point{}, draw.Src) // 2 px rule
+	r, ok := Detect(img, 600)
+	if !ok {
+		t.Fatal("no crop")
+	}
+	if r.Y+r.H < 4203 {
+		t.Fatalf("crop %v cuts the rule at y=4201", r)
+	}
+}
+
 func TestDetectNothingToTrim(t *testing.T) {
 	blank := a4()
 	speck := a4()
@@ -85,6 +102,8 @@ func TestApplyAndValid(t *testing.T) {
 		{Rect{-1, 0, 100, 100}, false},
 		{Rect{800, 0, 100, 100}, false},
 		{Rect{0, 0, 8, 100}, false},
+		{Rect{math.MaxInt - 10, 0, 100, 100}, false},
+		{Rect{0, math.MaxInt - 10, 100, 100}, false},
 	} {
 		if c.r.Valid(827, 1169) != c.want {
 			t.Errorf("%v.Valid = %v", c.r, !c.want)

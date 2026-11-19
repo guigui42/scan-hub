@@ -546,8 +546,14 @@ func (s *Server) cropPage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Same reservation as send: a PDF is never built from a half-saved crop.
+	unlock, err := s.jobs.lockSession(m.ID)
+	if err != nil {
+		s.fail(w, r, http.StatusConflict, "Wait for the scan or send to finish, then crop.")
+		return
+	}
+	defer unlock()
 	file := r.PostFormValue("file")
-	var err error
 	switch r.PostFormValue("action") {
 	case "auto":
 		var trimmed bool
@@ -590,8 +596,9 @@ func (s *Server) cropPage(w http.ResponseWriter, r *http.Request) {
 }
 
 // pageImage serves a page's thumbnail, or its image as it goes into the PDF
-// (cropped). ?full=1 serves the whole original for the crop editor. URLs
-// carry ?v=<Page.Rev>, so responses can be cached for good.
+// (cropped). ?full=1 serves the whole original for the crop editor. Pages
+// link with ?v=<Page.Rev>; only a response for the current revision (or the
+// original) may be cached, as a stale ?v gets the current rendering.
 func (s *Server) pageImage(thumb bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		m, err := s.d.Store.Get(r.PathValue("id"))
@@ -606,7 +613,11 @@ func (s *Server) pageImage(thumb bool) http.HandlerFunc {
 		}
 		p := m.Pages[i]
 		full := r.URL.Query().Get("full") == "1"
-		w.Header().Set("Cache-Control", "private, max-age=86400, immutable")
+		if full || r.URL.Query().Get("v") == p.Rev() {
+			w.Header().Set("Cache-Control", "private, max-age=86400, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		switch {
 		case thumb && p.Thumb != "":
 			w.Header().Set("Content-Type", "image/jpeg")

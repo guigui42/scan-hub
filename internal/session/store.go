@@ -267,8 +267,8 @@ func (s *Store) AddPage(id string, data []byte, scanner string, sheet, side int)
 		return Page{}, err
 	}
 	if thumb != nil {
-		if err := fsutil.WriteFileAtomic(filepath.Join(dir, thumbName(p.File)), thumb, 0o600); err == nil {
-			p.Thumb = thumbName(p.File)
+		if err := fsutil.WriteFileAtomic(filepath.Join(dir, thumbName(p.File, p.Rev())), thumb, 0o600); err == nil {
+			p.Thumb = thumbName(p.File, p.Rev())
 		}
 	}
 	m.Pages = append(m.Pages, p)
@@ -354,8 +354,12 @@ func (s *Store) setCrop(id string, p Page, img image.Image, r *crop.Rect) (Manif
 	if i < 0 {
 		return m, ErrNotFound
 	}
+	// Each rendering gets its own thumbnail file, so a cached URL never
+	// shows another crop.
+	old := m.Pages[i]
 	if thumb != nil {
-		name := thumbName(p.File)
+		m.Pages[i].Crop = r
+		name := thumbName(p.File, m.Pages[i].Rev())
 		if err := fsutil.WriteFileAtomic(filepath.Join(s.dir(id), name), thumb, 0o600); err != nil {
 			return m, err
 		}
@@ -363,11 +367,23 @@ func (s *Store) setCrop(id string, p Page, img image.Image, r *crop.Rect) (Manif
 	}
 	m.Pages[i].Crop = r
 	m.Updated = time.Now().UTC()
-	return m, s.writeManifest(m)
+	if err := s.writeManifest(m); err != nil {
+		return m, err
+	}
+	if old.Thumb != "" && old.Thumb != m.Pages[i].Thumb {
+		os.Remove(filepath.Join(s.dir(id), old.Thumb))
+	}
+	return m, nil
 }
 
-func thumbName(file string) string {
-	return strings.TrimSuffix(file, filepath.Ext(file)) + ".thumb.jpg"
+// thumbName names the thumbnail of a page rendering; the uncropped one
+// keeps the name earlier releases used.
+func thumbName(file, rev string) string {
+	base := strings.TrimSuffix(file, filepath.Ext(file))
+	if rev == "full" {
+		return base + ".thumb.jpg"
+	}
+	return base + ".thumb-" + rev + ".jpg"
 }
 
 // DeletePage removes the page stored as file from session id.

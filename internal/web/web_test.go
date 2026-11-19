@@ -652,6 +652,26 @@ func TestAutoCropAndCropEditor(t *testing.T) {
 		t.Fatalf("unknown page %d", code)
 	}
 
+	// Only the current revision is cacheable: a stale ?v gets today's crop.
+	m, _ = r.store.Get(sid)
+	thumb := "/sessions/" + sid + "/pages/" + p.File + "/thumb?v="
+	if _, _, h := r.get(thumb + m.Pages[0].Rev()); !strings.Contains(h.Get("Cache-Control"), "immutable") {
+		t.Fatalf("current revision not cacheable: %q", h.Get("Cache-Control"))
+	}
+	if _, _, h := r.get(thumb + "full"); h.Get("Cache-Control") != "no-store" {
+		t.Fatalf("stale revision cacheable: %q", h.Get("Cache-Control"))
+	}
+
+	// A crop waits for a send (or scan) holding the session.
+	unlock, err := r.ws.jobs.lockSession(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := crop(url.Values{"action": {"reset"}}); code != http.StatusConflict {
+		t.Fatalf("crop during send %d", code)
+	}
+	unlock()
+
 	// The PDF page is the crop: 85.6×54 mm card plus padding, at 100 dpi.
 	_, pdfBody, _ := r.get("/sessions/" + sid + "/pdf")
 	m, _ = r.store.Get(sid)

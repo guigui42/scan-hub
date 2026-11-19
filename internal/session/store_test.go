@@ -236,6 +236,12 @@ func TestCrop(t *testing.T) {
 	if w, h := thumbSize(got.Pages[0]); w != 100 || h != 100*c.H/c.W {
 		t.Fatalf("thumb %dx%d for crop %+v", w, h, c)
 	}
+	if got.Pages[0].Thumb == p.Thumb {
+		t.Fatal("a cropped rendering must get its own thumbnail file")
+	}
+	if _, err := os.Stat(s.ThumbPath(m.ID, p)); !os.IsNotExist(err) {
+		t.Fatalf("old thumbnail left behind: %v", err)
+	}
 	if b, _ := os.ReadFile(s.PagePath(m.ID, got.Pages[0])); !bytes.Equal(b, img) {
 		t.Fatal("original image altered")
 	}

@@ -5,6 +5,7 @@ package crop
 
 import (
 	"image"
+	"image/color"
 	"image/draw"
 	"slices"
 )
@@ -26,7 +27,8 @@ const MinSize = 16
 // Valid reports whether r lies inside a w×h image and is at least MinSize
 // on each side.
 func (r Rect) Valid(w, h int) bool {
-	return r.X >= 0 && r.Y >= 0 && r.W >= MinSize && r.H >= MinSize && r.X+r.W <= w && r.Y+r.H <= h
+	// Written so that no sum can overflow.
+	return r.X >= 0 && r.Y >= 0 && r.W >= MinSize && r.H >= MinSize && r.X <= w && r.Y <= h && r.W <= w-r.X && r.H <= h-r.Y
 }
 
 // Full reports whether r covers the whole w×h image.
@@ -58,21 +60,34 @@ func Detect(img image.Image, dpi int) (r Rect, ok bool) {
 	step := max(1, (max(W, H)+workSize-1)/workSize)
 	gw, gh := (W+step-1)/step, (H+step-1)/step
 
-	lum := make([]uint8, gw*gh)
+	// Each cell pools every pixel of its step×step block: its mean
+	// luminance (for the background level), darkest luminance and widest
+	// colour spread (so a one-pixel line or pen stroke is never missed).
+	sum := make([]int, gw*gh)
+	dark := make([]uint8, gw*gh)
 	spread := make([]uint8, gw*gh)
+	for i := range dark {
+		dark[i] = 255
+	}
+	eachPixel(img, func(x, y int, r8, g8, b8 uint8) {
+		i := (y/step)*gw + x/step
+		l := uint8((299*int(r8) + 587*int(g8) + 114*int(b8)) / 1000)
+		sum[i] += int(l)
+		dark[i] = min(dark[i], l)
+		spread[i] = max(spread[i], max(r8, g8, b8)-min(r8, g8, b8))
+	})
+	mean := make([]uint8, gw*gh)
 	for gy := range gh {
 		for gx := range gw {
-			r, g, bl, _ := img.At(b.Min.X+gx*step, b.Min.Y+gy*step).RGBA()
-			r8, g8, b8 := uint8(r>>8), uint8(g>>8), uint8(bl>>8)
-			lum[gy*gw+gx] = uint8((299*int(r8) + 587*int(g8) + 114*int(b8)) / 1000)
-			spread[gy*gw+gx] = max(r8, g8, b8) - min(r8, g8, b8)
+			n := (min(W, (gx+1)*step) - gx*step) * (min(H, (gy+1)*step) - gy*step)
+			mean[gy*gw+gx] = uint8(sum[gy*gw+gx] / n)
 		}
 	}
 	// The background is the light end of the histogram.
-	sorted := slices.Clone(lum)
+	sorted := slices.Clone(mean)
 	slices.Sort(sorted)
 	bg := int(sorted[len(sorted)*95/100])
-	content := func(i int) bool { return int(lum[i]) < bg-darkStep || spread[i] > chroma }
+	content := func(i int) bool { return int(dark[i]) < bg-darkStep || spread[i] > chroma }
 
 	px := func(mm float64) int { return int(mm * float64(dpi) / 25.4) }
 	edge := max(1, px(edgeMM)/step)
@@ -144,6 +159,37 @@ func Detect(img image.Image, dpi int) (r Rect, ok bool) {
 		return Rect{}, false
 	}
 	return r, true
+}
+
+// eachPixel calls fn with every pixel's 8-bit RGB, relative to the image
+// origin, with fast paths for what scanners decode to (JPEG: YCbCr or Gray;
+// TIFF: Gray or Paletted).
+func eachPixel(img image.Image, fn func(x, y int, r, g, b uint8)) {
+	b := img.Bounds()
+	switch m := img.(type) {
+	case *image.YCbCr:
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			for x := b.Min.X; x < b.Max.X; x++ {
+				yi, ci := m.YOffset(x, y), m.COffset(x, y)
+				r, g, bl := color.YCbCrToRGB(m.Y[yi], m.Cb[ci], m.Cr[ci])
+				fn(x-b.Min.X, y-b.Min.Y, r, g, bl)
+			}
+		}
+	case *image.Gray:
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			for x := b.Min.X; x < b.Max.X; x++ {
+				v := m.Pix[m.PixOffset(x, y)]
+				fn(x-b.Min.X, y-b.Min.Y, v, v, v)
+			}
+		}
+	default:
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			for x := b.Min.X; x < b.Max.X; x++ {
+				r, g, bl, _ := img.At(x, y).RGBA()
+				fn(x-b.Min.X, y-b.Min.Y, uint8(r>>8), uint8(g>>8), uint8(bl>>8))
+			}
+		}
+	}
 }
 
 // Apply returns the part of img inside r (relative to img's origin).
