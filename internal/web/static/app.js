@@ -42,22 +42,36 @@ document.addEventListener('alpine:init', () => {
       this.lightboxSrc = ''
     },
 
-    // Crop editor. The frame is kept in fractions of the page (0..1) and
-    // posted in pixels of the original image.
+    // Crop editor. The frame is kept in fractions of the page as rotated
+    // (0..1) and posted in pixels of it. The rotation is quarter turns plus
+    // a fine angle, clockwise, as the server applies them.
     cropOpen: false,
     cropPending: false,
+    gridOn: false,
     page: { w: 0, h: 0 },
+    rot: { turns: 0, angle: 0 },
+    shown: { turns: 0, angle: 0 }, // rotation of the loaded image
+    loading: null, // rotation of the image being fetched
+    rotTimer: null,
     frame: { x: 0, y: 0, w: 1, h: 1 },
+
+    get angleLabel() {
+      const a = this.rot.angle
+      return (a > 0 ? '+' : a < 0 ? '−' : '') + Math.abs(a).toFixed(1) + '°'
+    },
 
     openCrop(e) {
       const d = e.currentTarget.dataset
-      const w = Number(d.w), h = Number(d.h)
+      this.page = { w: Number(d.w), h: Number(d.h), src: d.src }
+      this.rot = { turns: Number(d.turns) || 0, angle: Number(d.angle) || 0 }
+      const v = this.viewSize()
       const c = (d.crop || '').split(',').map(Number)
-      this.page = { w, h }
-      this.frame = c.length === 4 ? { x: c[0] / w, y: c[1] / h, w: c[2] / w, h: c[3] / h } : { x: 0, y: 0, w: 1, h: 1 }
+      this.frame = c.length === 4 ? { x: c[0] / v.w, y: c[1] / v.h, w: c[2] / v.w, h: c[3] / v.h } : { x: 0, y: 0, w: 1, h: 1 }
       this.$refs.cropFile.value = d.file
       this.$refs.cropAction.value = 'save'
-      this.$refs.cropImg.src = d.src
+      this.gridOn = false
+      this.shown = { ...this.rot }
+      this.loadRot()
       this.cropOpen = true
       this.cropPending = false
       this.drawCrop()
@@ -72,6 +86,7 @@ document.addEventListener('alpine:init', () => {
       if (this.cropPending && e && e.type !== 'htmx:finally:request') return
       this.cropOpen = false
       this.cropPending = false
+      clearTimeout(this.rotTimer)
       this.setInert(false)
       const file = this.$refs.cropFile.value
       this.$nextTick(() => {
@@ -79,6 +94,54 @@ document.addEventListener('alpine:init', () => {
         if (btn) btn.focus()
       })
     },
+
+    // Size of the page once rotated, as crop.Rotation.Size computes it.
+    viewSize() {
+      let { w, h } = this.page
+      if (this.rot.turns % 2) [w, h] = [h, w]
+      const a = Math.abs(this.rot.angle) * Math.PI / 180
+      if (Math.abs(this.rot.angle) < 0.01) return { w, h }
+      const s = Math.sin(a), c = Math.cos(a)
+      return { w: Math.round(w * c + h * s), h: Math.round(w * s + h * c) }
+    },
+    turnBy(e) {
+      this.setRot({ turns: (this.rot.turns + Number(e.currentTarget.dataset.by) + 4) % 4, angle: this.rot.angle })
+    },
+    tiltBy(e) { this.setRot({ ...this.rot, angle: this.rot.angle + Number(e.currentTarget.dataset.by) }) },
+    tiltTo(e) { this.setRot({ ...this.rot, angle: Number(e.currentTarget.value) }) },
+    level() { this.setRot({ ...this.rot, angle: 0 }) },
+    // A new rotation frames the whole page again. The loaded image turns
+    // at once (CSS) and the server's rendering follows when the angle
+    // settles, so dragging the slider stays smooth.
+    setRot(r) {
+      r.angle = Math.round(Math.min(45, Math.max(-45, r.angle)) * 10) / 10
+      this.rot = r
+      this.gridOn = true
+      this.frame = { x: 0, y: 0, w: 1, h: 1 }
+      this.drawCrop()
+      clearTimeout(this.rotTimer)
+      if (r.turns !== this.shown.turns) {
+        this.loadRot()
+      } else {
+        this.tiltPreview()
+        this.rotTimer = setTimeout(() => this.loadRot(), 350)
+      }
+    },
+    loadRot() {
+      this.loading = { ...this.rot }
+      const { turns, angle } = this.loading
+      this.$refs.cropImg.src = this.page.src + (turns || angle ? `&turns=${turns}&angle=${angle}` : '')
+    },
+    cropLoaded() {
+      if (this.loading) this.shown = this.loading
+      this.loading = null
+      this.tiltPreview()
+    },
+    tiltPreview() {
+      const d = this.rot.turns === this.shown.turns ? this.rot.angle - this.shown.angle : 0
+      this.$refs.cropImg.style.transform = d ? `rotate(${d}deg)` : ''
+    },
+
     // A modal dialog: everything outside it is inert while it's open.
     setInert(on) {
       for (let el = this.$refs.cropper; el && el !== document.body; el = el.parentElement) {
@@ -151,7 +214,10 @@ document.addEventListener('alpine:init', () => {
         el.style.width = f.w * 100 + '%'
         el.style.height = f.h * 100 + '%'
       }
-      const { w, h } = this.page
+      const { w, h } = this.viewSize()
+      this.$refs.cropTurns.value = this.rot.turns
+      this.$refs.cropAngle.value = this.rot.angle
+      this.$refs.cropRange.value = this.rot.angle
       const x = Math.round(f.x * w), y = Math.round(f.y * h)
       this.$refs.cropX.value = x
       this.$refs.cropY.value = y

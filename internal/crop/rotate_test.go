@@ -1,0 +1,95 @@
+package crop
+
+import (
+	"image"
+	"image/color"
+	"math"
+	"testing"
+)
+
+// tiltedCard is a white A4 page at 100 dpi holding a card with a photo and
+// text lines, turned by tilt degrees clockwise (as if laid askew on the
+// glass).
+func tiltedCard(tilt float64) image.Image {
+	img := a4()
+	fill(img, image.Rect(150, 200, 487, 413), color.RGBA{196, 214, 236, 255})
+	fill(img, image.Rect(170, 230, 260, 360), color.RGBA{90, 78, 70, 255})
+	for i := range 6 {
+		fill(img, image.Rect(280, 240+i*22, 470-i*15, 249+i*22), color.RGBA{40, 50, 80, 255})
+	}
+	return Rotate(img, Rotation{Angle: tilt})
+}
+
+func TestSkewStraightensTiltedCard(t *testing.T) {
+	for _, tilt := range []float64{2, -3.5, 0.6, 12} {
+		got, ok := Skew(tiltedCard(tilt))
+		if !ok || math.Abs(got+tilt) > 0.3 {
+			t.Errorf("tilt %v°: Skew = %v, %v; want %v ±0.3", tilt, got, ok, -tilt)
+		}
+	}
+}
+
+func TestSkewLeavesStraightAndBlankPages(t *testing.T) {
+	if got, ok := Skew(tiltedCard(0)); ok {
+		t.Errorf("straight card: Skew = %v, want none", got)
+	}
+	if got, ok := Skew(a4()); ok {
+		t.Errorf("blank page: Skew = %v, want none", got)
+	}
+}
+
+func TestRotationSize(t *testing.T) {
+	for _, c := range []struct {
+		r    Rotation
+		w, h int
+	}{
+		{Rotation{}, 800, 1000},
+		{Rotation{Turns: 1}, 1000, 800},
+		{Rotation{Turns: 2}, 800, 1000},
+		{Rotation{Angle: 90}, 1000, 800},
+		{Rotation{Angle: -30}, int(math.Round(800*math.Cos(math.Pi/6) + 1000*0.5)), int(math.Round(800*0.5 + 1000*math.Cos(math.Pi/6)))},
+	} {
+		if w, h := c.r.Size(800, 1000); w != c.w || h != c.h {
+			t.Errorf("%+v: %dx%d, want %dx%d", c.r, w, h, c.w, c.h)
+		}
+	}
+}
+
+func TestRotateQuarterTurns(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 3, 2))
+	src.Set(0, 0, color.RGBA{255, 0, 0, 255}) // top-left marker
+	for turns, want := range []image.Point{{0, 0}, {1, 0}, {2, 1}, {0, 2}} {
+		out := Rotate(src, Rotation{Turns: turns})
+		w, h := Rotation{Turns: turns}.Size(3, 2)
+		if b := out.Bounds(); b.Dx() != w || b.Dy() != h {
+			t.Fatalf("turns %d: %v, want %dx%d", turns, b, w, h)
+		}
+		if r, _, _, _ := out.At(want.X, want.Y).RGBA(); r>>8 != 255 {
+			t.Errorf("turns %d: marker not at %v", turns, want)
+		}
+	}
+	g := image.NewGray(image.Rect(0, 0, 4, 2))
+	if _, ok := Rotate(g, Rotation{Turns: 1}).(*image.Gray); !ok {
+		t.Error("a grey page should stay grey")
+	}
+}
+
+func TestRotateAngleKeepsWholePage(t *testing.T) {
+	img := a4()
+	fill(img, image.Rect(0, 0, 827, 20), color.Black) // a dark top edge
+	out := Rotate(img, Rotation{Angle: 10})
+	w, h := Rotation{Angle: 10}.Size(827, 1169)
+	if b := out.Bounds(); b.Dx() != w || b.Dy() != h {
+		t.Fatalf("bounds %v, want %dx%d", b, w, h)
+	}
+	// Uncovered corners are white; the turned top edge stays inside.
+	if r, g, b, _ := out.At(1, h-2).RGBA(); r>>8 < 250 || g>>8 < 250 || b>>8 < 250 {
+		t.Error("corner not white")
+	}
+	// The middle of the top edge, turned about the centre, 10 px inwards.
+	s, c := math.Sin(10*math.Pi/180), math.Cos(10*math.Pi/180)
+	x, y := float64(w)/2+(1169/2-10)*s, float64(h)/2-(1169/2-10)*c
+	if r, _, _, _ := out.At(int(x), int(y)).RGBA(); r>>8 > 60 {
+		t.Error("top edge lost")
+	}
+}

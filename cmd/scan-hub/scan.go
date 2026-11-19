@@ -110,7 +110,7 @@ func scanCmd(args []string) error {
 			}
 		}
 		if err == nil {
-			log.Info("page stored", "session", sid, "file", pg.File, "width", pg.OutW(), "height", pg.OutH(), "dpi", pg.DPI, "bytes", pg.Size)
+			log.Info("page stored", "session", sid, "file", pg.File, "width", pg.OutW(), "height", pg.OutH(), "angle", pg.Angle, "dpi", pg.DPI, "bytes", pg.Size)
 		}
 		return err
 	})

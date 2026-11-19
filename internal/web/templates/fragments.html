@@ -78,8 +78,8 @@
     </button>
     <span class="sheet-no">{{inc $i}}</span>
     <span class="sheet-foot">
-      <span class="sheet-meta">{{scannerLabel $p.Scanner}}{{if $p.DPI}} · {{$p.DPI}} dpi{{end}}{{if $p.Crop}} · <span class="sheet-cropped">cropped</span>{{end}}</span>
-      {{if and $p.Width $p.Height}}<button type="button" class="sheet-crop" @click="openCrop" data-file="{{$p.File}}" data-src="/sessions/{{$.M.ID}}/pages/{{$p.File}}/image?full=1" data-w="{{$p.Width}}" data-h="{{$p.Height}}"{{with $p.Crop}} data-crop="{{.X}},{{.Y}},{{.W}},{{.H}}"{{end}} aria-label="Crop page {{inc $i}}">Crop</button>{{end}}
+      <span class="sheet-meta">{{scannerLabel $p.Scanner}}{{if $p.DPI}} · {{$p.DPI}} dpi{{end}}{{if $p.Angle}} · <span class="sheet-cropped">straightened</span>{{else if $p.Turns}} · <span class="sheet-cropped">rotated</span>{{end}}{{if $p.Crop}} · <span class="sheet-cropped">cropped</span>{{end}}</span>
+      {{if and $p.Width $p.Height}}<button type="button" class="sheet-crop" @click="openCrop" data-file="{{$p.File}}" data-src="/sessions/{{$.M.ID}}/pages/{{$p.File}}/image?full=1" data-w="{{$p.Width}}" data-h="{{$p.Height}}" data-turns="{{$p.Turns}}" data-angle="{{$p.Angle}}"{{with $p.Crop}} data-crop="{{.X}},{{.Y}},{{.W}},{{.H}}"{{end}} aria-label="Crop &amp; rotate page {{inc $i}}">Crop &amp; rotate</button>{{end}}
     </span>
     <span class="sheet-del-wrap" x-data="confirm">
       <button type="button" class="sheet-del" x-show="idle" @click="arm" aria-label="Remove page {{inc $i}}">✕</button>

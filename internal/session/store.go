@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -58,33 +59,44 @@ type Page struct {
 	Sheet   int       `json:"sheet"`
 	Side    int       `json:"side"`
 	Added   time.Time `json:"added"`
-	// Crop is the part of the image that goes into the PDF; nil keeps the
-	// whole page. The stored image is never altered.
+	// Rotation turns the image upright before the crop (turns, angle).
+	crop.Rotation
+	// Crop is the part of the rotated image that goes into the PDF; nil
+	// keeps the whole page. The stored image is never altered.
 	Crop *crop.Rect `json:"crop,omitempty"`
 }
 
-// OutW and OutH are the page size in pixels after its crop.
+// OutW and OutH are the page size in pixels after its rotation and crop.
 func (p Page) OutW() int {
 	if p.Crop != nil {
 		return p.Crop.W
 	}
-	return p.Width
+	w, _ := p.Rotation.Size(p.Width, p.Height)
+	return w
 }
 
 func (p Page) OutH() int {
 	if p.Crop != nil {
 		return p.Crop.H
 	}
-	return p.Height
+	_, h := p.Rotation.Size(p.Width, p.Height)
+	return h
 }
 
 // Rev identifies how the page renders, for cache busting: it changes with
-// the crop.
+// the rotation and the crop.
 func (p Page) Rev() string {
-	if p.Crop == nil {
+	var parts []string
+	if !p.Rotation.IsZero() {
+		parts = append(parts, fmt.Sprintf("r%d_%s", p.Turns, strconv.FormatFloat(p.Angle, 'f', -1, 64)))
+	}
+	if p.Crop != nil {
+		parts = append(parts, fmt.Sprintf("%d-%d-%d-%d", p.Crop.X, p.Crop.Y, p.Crop.W, p.Crop.H))
+	}
+	if len(parts) == 0 {
 		return "full"
 	}
-	return fmt.Sprintf("%d-%d-%d-%d", p.Crop.X, p.Crop.Y, p.Crop.W, p.Crop.H)
+	return strings.Join(parts, "_")
 }
 
 // Manifest is the persisted state of a session.
@@ -280,29 +292,62 @@ func (s *Store) AddPage(id string, data []byte, scanner string, sheet, side int)
 	return p, nil
 }
 
-// SetCrop sets the crop of the page stored as file, or clears it (r nil or
-// the whole page), and redraws its thumbnail. The image itself is kept.
+// SetCrop sets the crop of the page stored as file, in pixels of the page
+// as rotated, or clears it (r nil or the whole page), and redraws its
+// thumbnail. The rotation and the image itself are kept.
 func (s *Store) SetCrop(id, file string, r *crop.Rect) (Manifest, error) {
 	p, img, err := s.pageImage(id, file)
 	if err != nil {
 		return Manifest{}, err
 	}
-	return s.setCrop(id, p, img, r)
+	return s.setView(id, p, crop.Rotate(img, p.Rotation), p.Rotation, r)
 }
 
-// AutoCrop trims the blank glass around the page stored as file. ok is
-// false when there was nothing to trim (the page is left as it was).
+// SetView sets both the rotation and the crop (in pixels of the page as
+// rotated) of the page stored as file.
+func (s *Store) SetView(id, file string, rot crop.Rotation, r *crop.Rect) (Manifest, error) {
+	if !rot.Valid() {
+		return Manifest{}, fmt.Errorf("%w: rotation %+v", ErrBadCrop, rot)
+	}
+	p, img, err := s.pageImage(id, file)
+	if err != nil {
+		return Manifest{}, err
+	}
+	return s.setView(id, p, crop.Rotate(img, rot), rot, r)
+}
+
+// AutoCrop straightens a freshly scanned page stored as file and trims the
+// blank glass around it. ok is false when there was nothing to do (the
+// page is left as it was).
 func (s *Store) AutoCrop(id, file string) (m Manifest, ok bool, err error) {
+	return s.Detect(id, file, crop.Rotation{}, true)
+}
+
+// Detect turns the page stored as file by rot (with the angle estimated
+// from its content when straighten is set) and crops it to the document
+// found on the glass. ok is false when that changes nothing: no tilt to
+// straighten and no blank glass to trim (the page is left as it was).
+func (s *Store) Detect(id, file string, rot crop.Rotation, straighten bool) (m Manifest, ok bool, err error) {
+	if !rot.Valid() {
+		return Manifest{}, false, fmt.Errorf("%w: rotation %+v", ErrBadCrop, rot)
+	}
 	p, img, err := s.pageImage(id, file)
 	if err != nil {
 		return Manifest{}, false, err
 	}
-	r, ok := crop.Detect(img, p.DPI)
-	if !ok {
+	if straighten {
+		rot.Angle, _ = crop.Skew(crop.Rotate(img, crop.Rotation{Turns: rot.Turns}))
+	}
+	view := crop.Rotate(img, rot)
+	var c *crop.Rect
+	if r, trimmed := crop.Detect(view, p.DPI); trimmed {
+		c = &r
+	}
+	if c == nil && (!straighten || rot.Angle == 0) {
 		m, err = s.Get(id)
 		return m, false, err
 	}
-	m, err = s.setCrop(id, p, img, &r)
+	m, err = s.setView(id, p, view, rot, c)
 	return m, err == nil, err
 }
 
@@ -328,8 +373,10 @@ func (s *Store) pageImage(id, file string) (Page, image.Image, error) {
 	return p, img, nil
 }
 
-func (s *Store) setCrop(id string, p Page, img image.Image, r *crop.Rect) (Manifest, error) {
-	b := img.Bounds()
+// setView stores the rotation and crop of page p; view is its image
+// already turned by rot.
+func (s *Store) setView(id string, p Page, view image.Image, rot crop.Rotation, r *crop.Rect) (Manifest, error) {
+	b := view.Bounds()
 	if r != nil {
 		if !r.Valid(b.Dx(), b.Dy()) {
 			return Manifest{}, fmt.Errorf("%w: %+v on a %dx%d page", ErrBadCrop, *r, b.Dx(), b.Dy())
@@ -338,11 +385,14 @@ func (s *Store) setCrop(id string, p Page, img image.Image, r *crop.Rect) (Manif
 			r = nil
 		}
 	}
-	view := img
-	if r != nil {
-		view = crop.Apply(img, *r)
+	if rot.IsZero() {
+		rot = crop.Rotation{}
 	}
-	thumb := s.thumbnail(view)
+	shown := view
+	if r != nil {
+		shown = crop.Apply(view, *r)
+	}
+	thumb := s.thumbnail(shown)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -358,14 +408,14 @@ func (s *Store) setCrop(id string, p Page, img image.Image, r *crop.Rect) (Manif
 	// shows another crop.
 	old := m.Pages[i]
 	if thumb != nil {
-		m.Pages[i].Crop = r
+		m.Pages[i].Rotation, m.Pages[i].Crop = rot, r
 		name := thumbName(p.File, m.Pages[i].Rev())
 		if err := fsutil.WriteFileAtomic(filepath.Join(s.dir(id), name), thumb, 0o600); err != nil {
 			return m, err
 		}
 		m.Pages[i].Thumb = name
 	}
-	m.Pages[i].Crop = r
+	m.Pages[i].Rotation, m.Pages[i].Crop = rot, r
 	m.Updated = time.Now().UTC()
 	if err := s.writeManifest(m); err != nil {
 		return m, err

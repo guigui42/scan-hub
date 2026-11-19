@@ -427,7 +427,8 @@ button { font: inherit; color: inherit; }
   position: relative; touch-action: none; user-select: none; cursor: crosshair;
   box-shadow: 0 30px 60px -20px #000;
 }
-.cropper-stage img { display: block; max-width: min(calc(100vw - 32px), 900px); max-height: calc(100vh - 170px); background: #fff; pointer-events: none; }
+.cropper-clip { overflow: hidden; }
+.cropper-stage img { display: block; transform-origin: 50% 50%; max-width: min(calc(100vw - 32px), 900px); max-height: calc(100vh - 230px); background: #fff; pointer-events: none; }
 /* The shade clips the dimming to the page; the frame and its handles sit
    on top, unclipped. */
 .cropper-shade { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
@@ -441,6 +442,17 @@ button { font: inherit; color: inherit; }
 .cropper-h[data-mode="ne"] { right: -11px; top: -11px; cursor: nesw-resize; }
 .cropper-h[data-mode="sw"] { left: -11px; bottom: -11px; cursor: nesw-resize; }
 .cropper-h[data-mode="se"] { right: -11px; bottom: -11px; cursor: nwse-resize; }
+/* Straightening guide: text lines should run along it. */
+.cropper-grid {
+  position: absolute; inset: 0; pointer-events: none;
+  background-image:
+    repeating-linear-gradient(to bottom, rgba(40, 110, 220, .45) 0 1px, transparent 1px 32px),
+    repeating-linear-gradient(to right, rgba(40, 110, 220, .3) 0 1px, transparent 1px 32px);
+}
+.cropper-rotate { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 6px; }
+.cropper-rotate .link-btn { background: var(--paper-hi); min-width: 40px; }
+.cropper-rotate .cropper-level { font-family: var(--mono); min-width: 64px; }
+.cropper-angle input { width: min(220px, 40vw); accent-color: var(--paper-hi); vertical-align: middle; }
 .cropper-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
 .cropper-actions .link-btn { background: var(--paper-hi); }
 .cropper-actions .link-btn.primary { background: var(--ink); color: var(--paper-hi); border-color: var(--ink); }

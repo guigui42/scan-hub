@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/guigui42/scan-hub/internal/crop"
 	"github.com/guigui42/scan-hub/internal/escl"
 	"github.com/guigui42/scan-hub/internal/escl/escltest"
 	"github.com/guigui42/scan-hub/internal/paperless"
@@ -679,5 +680,61 @@ func TestAutoCropAndCropEditor(t *testing.T) {
 	want := fmt.Sprintf("/MediaBox [0 0 %.2f %.2f]", float64(c.W)*72/100, float64(c.H)*72/100)
 	if !strings.Contains(pdfBody, want) {
 		t.Fatalf("PDF lacks %q", want)
+	}
+}
+
+func TestRotateAndStraightenEditor(t *testing.T) {
+	r := newRig(t)
+	r.ep.SetTilt(3)
+	r.get("/")
+	_, _, h := r.send("POST", "/sessions", nil, nil)
+	sid := strings.TrimPrefix(h.Get("HX-Redirect"), "/sessions/")
+	code, body, _ := r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"glass"}, "color": {"color"}, "dpi": {"300"}, "region": {"a4"}}, nil)
+	if code != http.StatusAccepted {
+		t.Fatalf("scan %d %s", code, body)
+	}
+	waitJob(t, r, body)
+	m, _ := r.store.Get(sid)
+	p := m.Pages[0]
+	edit := func(v url.Values) (int, string) {
+		v.Set("file", p.File)
+		code, body, _ := r.send("POST", "/sessions/"+sid+"/crop", v, nil)
+		return code, body
+	}
+
+	if code, body := edit(url.Values{"action": {"straighten"}, "turns": {"0"}, "angle": {"0"}}); code != 200 || !strings.Contains(body, ">straightened<") || !strings.Contains(body, "data-crop=") {
+		t.Fatalf("straighten %d %s", code, body)
+	}
+	m, _ = r.store.Get(sid)
+	if a := m.Pages[0].Angle; a > -2.7 || a < -3.3 {
+		t.Fatalf("straightened by %v°, want about -3", a)
+	}
+
+	// A quarter turn, framing the whole turned page (one rounding pixel over).
+	code, body = edit(url.Values{"action": {"save"}, "turns": {"1"}, "angle": {"0"}, "x": {"0"}, "y": {"0"}, "w": {"1170"}, "h": {"827"}})
+	if code != 200 || !strings.Contains(body, ">rotated<") || strings.Contains(body, "data-crop=") || !strings.Contains(body, `data-turns="1"`) {
+		t.Fatalf("turn %d %s", code, body)
+	}
+	if code, body := edit(url.Values{"action": {"reset"}, "turns": {"0"}, "angle": {"60"}}); code != 422 || !strings.Contains(body, "doesn&#39;t fit") {
+		t.Fatalf("out-of-range angle %d %s", code, body)
+	}
+
+	// The editor fetches the page turned as it previews it.
+	for _, c := range []struct {
+		q    string
+		w, h int
+	}{{"", 827, 1169}, {"&turns=1", 1169, 827}, {"&angle=10", 0, 0}} {
+		w, h := c.w, c.h
+		if w == 0 {
+			w, h = crop.Rotation{Angle: 10}.Size(827, 1169)
+		}
+		code, img, _ := r.get("/sessions/" + sid + "/pages/" + p.File + "/image?full=1" + c.q)
+		cfg, err := jpeg.DecodeConfig(strings.NewReader(img))
+		if code != 200 || err != nil || cfg.Width != w || cfg.Height != h {
+			t.Fatalf("full%s: %d %v %dx%d, want %dx%d", c.q, code, err, cfg.Width, cfg.Height, w, h)
+		}
+	}
+	if code, _, _ := r.get("/sessions/" + sid + "/pages/" + p.File + "/image?full=1&turns=7"); code != 400 {
+		t.Fatalf("bad turns %d", code)
 	}
 }

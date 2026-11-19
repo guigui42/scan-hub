@@ -131,6 +131,7 @@ func run(addr, dir string, paper int) error {
 
 	for _, ep := range []struct{ id, name string }{{"glass", "Epson ET-2750"}, {"glass-2", "Office AirScan"}} {
 		f := escltest.Start()
+		f.SetTilt(2) // laid a little askew, as cards usually are
 		defer f.Close()
 		c, err := escl.New(escl.Options{BaseURL: f.URL, TLSPin: escl.SPKIPin(f.Certificate()), Logger: log.With("scanner", ep.id)})
 		if err != nil {
