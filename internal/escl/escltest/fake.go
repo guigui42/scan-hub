@@ -14,15 +14,18 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/guigui42/scan-hub/internal/crop"
 )
 
 // Server is a running fake.
 type Server struct {
 	*httptest.Server
 
-	NotReady int  // NextDocument answers 503 this many times first
-	Busy     bool // ScanJobs answers 503
-	Hang     bool // NextDocument blocks until the client goes away
+	NotReady int     // NextDocument answers 503 this many times first
+	Busy     bool    // ScanJobs answers 503
+	Hang     bool    // NextDocument blocks until the client goes away
+	Tilt     float64 // degrees the card lies askew on the glass, clockwise
 
 	mu       sync.Mutex
 	nextID   int
@@ -65,7 +68,7 @@ func Start() *Server {
 		id := r.PathValue("id")
 		s.mu.Lock()
 		n, ok := s.jobs[id]
-		hang := s.Hang
+		hang, tilt := s.Hang, s.Tilt
 		s.mu.Unlock()
 		if !ok {
 			http.NotFound(w, r)
@@ -87,7 +90,7 @@ func Start() *Server {
 		s.jobs[id] = n + 1
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "image/jpeg")
-		w.Write(GlassJPEG())
+		w.Write(TiltedGlassJPEG(tilt))
 	})
 	mux.HandleFunc("DELETE /eSCL/ScanJobs/{id}", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
@@ -101,24 +104,38 @@ func Start() *Server {
 
 // GlassJPEG is an A4 scan at 100 dpi (827×1169, JFIF density set) of an
 // ID card lying in the top-left corner of an otherwise empty glass.
-func GlassJPEG() []byte {
+func GlassJPEG() []byte { return TiltedGlassJPEG(0) }
+
+// TiltedGlassJPEG is GlassJPEG with the card turned by tilt degrees
+// clockwise, as if laid askew on the glass.
+func TiltedGlassJPEG(tilt float64) []byte {
 	img := image.NewRGBA(image.Rect(0, 0, 827, 1169))
+	glass := color.RGBA{250, 250, 248, 255}
+	draw.Draw(img, img.Bounds(), image.NewUniform(glass), image.Point{}, draw.Src)
+	card := image.NewRGBA(image.Rect(0, 0, 337, 213)) // 85.6×54 mm
 	fill := func(r image.Rectangle, c color.Color) {
-		draw.Draw(img, r, image.NewUniform(c), image.Point{}, draw.Src)
+		draw.Draw(card, r, image.NewUniform(c), image.Point{}, draw.Src)
 	}
-	fill(img.Bounds(), color.RGBA{250, 250, 248, 255})
-	card := image.Rect(24, 24, 361, 237) // 85.6×54 mm
-	fill(card, color.RGBA{196, 214, 236, 255})
-	fill(image.Rect(40, 70, 130, 200), color.RGBA{90, 78, 70, 255}) // photo
+	fill(card.Bounds(), color.RGBA{196, 214, 236, 255})
+	fill(image.Rect(16, 46, 106, 176), color.RGBA{90, 78, 70, 255}) // photo
 	for i := range 6 {
-		fill(image.Rect(150, 80+i*20, 330-i*15, 88+i*20), color.RGBA{40, 50, 80, 255}) // text
+		fill(image.Rect(126, 56+i*20, 306-i*15, 64+i*20), color.RGBA{40, 50, 80, 255}) // text
 	}
+	turned := crop.Rotate(card, crop.Rotation{Angle: tilt})
+	draw.Draw(img, turned.Bounds().Add(image.Pt(24, 24)), turned, image.Point{}, draw.Src)
 	var b bytes.Buffer
 	jpeg.Encode(&b, img, &jpeg.Options{Quality: 85})
 	out := b.Bytes()
 	// SOI, then a JFIF APP0 segment: version 1.1, 100×100 dots per inch.
 	app0 := []byte{0xFF, 0xE0, 0, 16, 'J', 'F', 'I', 'F', 0, 1, 1, 1, 0, 100, 0, 100, 0, 0}
 	return append(append(out[:2:2], app0...), out[2:]...)
+}
+
+// SetTilt sets Tilt while the server runs.
+func (s *Server) SetTilt(deg float64) {
+	s.mu.Lock()
+	s.Tilt = deg
+	s.mu.Unlock()
 }
 
 // LastSettings returns the most recent ScanSettings body.

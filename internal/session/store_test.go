@@ -7,7 +7,9 @@ import (
 	"errors"
 	"image"
 	"image/jpeg"
+	"math"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -263,5 +265,74 @@ func TestCrop(t *testing.T) {
 	blank, _ := s.AddPage(m.ID, venstest.PageJPEG(0, 0), "glass", 0, 0)
 	if _, ok, err := s.AutoCrop(m.ID, blank.File); ok || err != nil {
 		t.Fatalf("full-bleed page cropped: %v %v", ok, err)
+	}
+}
+
+func TestRotateAndStraighten(t *testing.T) {
+	s := open(t, Options{ThumbWidth: 100})
+	m, _ := s.Create("ui")
+	img := escltest.TiltedGlassJPEG(3)
+	p, err := s.AddPage(m.ID, img, "glass", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A scan with auto-crop straightens the card, then trims around it.
+	got, ok, err := s.AutoCrop(m.ID, p.File)
+	if err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	q := got.Pages[0]
+	if math.Abs(q.Angle+3) > 0.3 || q.Turns != 0 || q.Crop == nil {
+		t.Fatalf("page %+v, want about -3° and a crop", q)
+	}
+	// 85.6×54 mm at 100 dpi plus 3 mm of padding each side.
+	if q.Crop.W < 337 || q.Crop.W > 337+2*11+12 || q.Crop.H < 213 || q.Crop.H > 213+2*11+12 {
+		t.Fatalf("crop %+v of the straightened card", q.Crop)
+	}
+	if q.Rev() == "full" || !strings.Contains(q.Rev(), "r0_") {
+		t.Fatalf("rev %q ignores the rotation", q.Rev())
+	}
+	if b, _ := os.ReadFile(s.PagePath(m.ID, q)); !bytes.Equal(b, img) {
+		t.Fatal("original image altered")
+	}
+
+	// A quarter turn makes it landscape; a crop is of the turned page.
+	got, err = s.SetView(m.ID, p.File, crop.Rotation{Turns: 1}, nil)
+	if err != nil || got.Pages[0].OutW() != 1169 || got.Pages[0].OutH() != 827 || got.Pages[0].Crop != nil {
+		t.Fatalf("turned page %+v %v", got.Pages[0], err)
+	}
+	if _, err := s.SetCrop(m.ID, p.File, &crop.Rect{X: 900, Y: 0, W: 200, H: 800}); err != nil {
+		t.Fatalf("crop inside the turned page: %v", err)
+	}
+	if _, err := s.SetView(m.ID, p.File, crop.Rotation{Angle: 60}, nil); !errors.Is(err, ErrBadCrop) {
+		t.Fatalf("out-of-range angle: %v", err)
+	}
+	// Back to as scanned: the original thumbnail name again.
+	got, err = s.SetView(m.ID, p.File, crop.Rotation{}, nil)
+	if err != nil || got.Pages[0].Rev() != "full" || got.Pages[0].Thumb != p.Thumb {
+		t.Fatalf("reset %+v %v", got.Pages[0], err)
+	}
+
+	// Straighten on a straight page: nothing to do.
+	straight, _ := s.AddPage(m.ID, venstest.PageJPEG(0, 0), "glass", 0, 0)
+	if _, ok, err := s.Detect(m.ID, straight.File, crop.Rotation{}, true); ok || err != nil {
+		t.Fatalf("straight full-bleed page changed: %v %v", ok, err)
+	}
+	// With nothing to trim, a new quarter turn is still saved...
+	got, ok, err = s.Detect(m.ID, straight.File, crop.Rotation{Turns: 1}, false)
+	if err != nil || !ok || got.Pages[1].Turns != 1 || got.Pages[1].Crop != nil {
+		t.Fatalf("quarter turn of a full-bleed page: %+v %v %v", got.Pages[1], ok, err)
+	}
+	if _, ok, err := s.Detect(m.ID, straight.File, crop.Rotation{Turns: 1}, false); ok || err != nil {
+		t.Fatalf("same turn again changed the page: %v %v", ok, err)
+	}
+	// ...and straightening clears a saved fine angle.
+	if _, err := s.SetView(m.ID, straight.File, crop.Rotation{Angle: 2}, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err = s.Detect(m.ID, straight.File, crop.Rotation{}, true)
+	if err != nil || !ok || !got.Pages[1].Rotation.IsZero() || got.Pages[1].Crop != nil {
+		t.Fatalf("straighten kept the old angle: %+v %v %v", got.Pages[1], ok, err)
 	}
 }

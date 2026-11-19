@@ -16,6 +16,7 @@ import (
 	"image/jpeg"
 	"io/fs"
 	"log/slog"
+	"math"
 	"mime"
 	"net/http"
 	"os"
@@ -539,8 +540,9 @@ func (s *Server) deletePage(w http.ResponseWriter, r *http.Request) {
 	s.fragment(w, http.StatusOK, "pages", sessionView{M: m, HasOutbox: s.d.Outbox != nil})
 }
 
-// cropPage saves, detects or clears the crop of one page (form: file,
-// action=save|auto|reset, and x, y, w, h in pixels of the original for save).
+// cropPage saves the rotation and crop of one page, or detects them (form:
+// file, action=save|auto|straighten|reset, turns and angle of the rotation,
+// and x, y, w, h in pixels of the rotated page for save).
 func (s *Server) cropPage(w http.ResponseWriter, r *http.Request) {
 	m, ok := s.loadSession(w, r)
 	if !ok {
@@ -554,39 +556,52 @@ func (s *Server) cropPage(w http.ResponseWriter, r *http.Request) {
 	}
 	defer unlock()
 	file := r.PostFormValue("file")
-	switch r.PostFormValue("action") {
-	case "auto":
-		var trimmed bool
-		m, trimmed, err = s.d.Store.AutoCrop(m.ID, file)
-		if err == nil && !trimmed {
-			s.fail(w, r, http.StatusUnprocessableEntity, "Nothing to trim: no blank glass found around that page.")
-			return
-		}
-	case "reset":
-		m, err = s.d.Store.SetCrop(m.ID, file, nil)
-	case "save":
-		var c crop.Rect
-		for _, f := range []struct {
-			dst  *int
-			name string
-		}{{&c.X, "x"}, {&c.Y, "y"}, {&c.W, "w"}, {&c.H, "h"}} {
-			if *f.dst, err = strconv.Atoi(r.PostFormValue(f.name)); err != nil {
-				err = session.ErrBadCrop
-				break
+	i := slices.IndexFunc(m.Pages, func(p session.Page) bool { return p.File == file })
+	if i < 0 {
+		s.fail(w, r, http.StatusNotFound, "That page is gone.")
+		return
+	}
+	p := m.Pages[i]
+	rot, err := formRotation(r.PostFormValue, p.Rotation)
+	if err == nil {
+		switch action := r.PostFormValue("action"); action {
+		case "auto", "straighten":
+			var changed bool
+			m, changed, err = s.d.Store.Detect(m.ID, file, rot, action == "straighten")
+			if err == nil && !changed {
+				msg := "Nothing to trim: no blank glass found around that page."
+				if action == "straighten" {
+					msg = "That page already looks straight, with no blank glass to trim."
+				}
+				s.fail(w, r, http.StatusUnprocessableEntity, msg)
+				return
 			}
+		case "reset":
+			m, err = s.d.Store.SetView(m.ID, file, rot, nil)
+		case "save":
+			var c crop.Rect
+			if c, err = formRect(r.PostFormValue); err == nil {
+				// The editor works out the rotated size in floating point
+				// too; forgive it a rounding pixel at the far edges.
+				vw, vh := rot.Size(p.Width, p.Height)
+				if c.X+c.W > vw && c.X+c.W <= vw+2 {
+					c.W = vw - c.X
+				}
+				if c.Y+c.H > vh && c.Y+c.H <= vh+2 {
+					c.H = vh - c.Y
+				}
+				m, err = s.d.Store.SetView(m.ID, file, rot, &c)
+			}
+		default:
+			err = session.ErrBadCrop
 		}
-		if err == nil {
-			m, err = s.d.Store.SetCrop(m.ID, file, &c)
-		}
-	default:
-		err = session.ErrBadCrop
 	}
 	switch {
 	case errors.Is(err, session.ErrNotFound):
 		s.fail(w, r, http.StatusNotFound, "That page is gone.")
 		return
 	case errors.Is(err, session.ErrBadCrop):
-		s.fail(w, r, http.StatusUnprocessableEntity, "That crop doesn't fit the page.")
+		s.fail(w, r, http.StatusUnprocessableEntity, "That crop or rotation doesn't fit the page.")
 		return
 	case err != nil:
 		s.fail(w, r, http.StatusInternalServerError, "Could not crop the page.")
@@ -595,10 +610,49 @@ func (s *Server) cropPage(w http.ResponseWriter, r *http.Request) {
 	s.fragment(w, http.StatusOK, "pages", sessionView{M: m, HasOutbox: s.d.Outbox != nil})
 }
 
+// formRotation reads turns and angle; a missing field keeps cur's.
+func formRotation(get func(string) string, cur crop.Rotation) (crop.Rotation, error) {
+	rot := cur
+	if v := get("turns"); v != "" {
+		t, err := strconv.Atoi(v)
+		if err != nil {
+			return rot, session.ErrBadCrop
+		}
+		rot.Turns = t
+	}
+	if v := get("angle"); v != "" {
+		a, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return rot, session.ErrBadCrop
+		}
+		rot.Angle = math.Round(a*100) / 100
+	}
+	if !rot.Valid() {
+		return rot, session.ErrBadCrop
+	}
+	return rot, nil
+}
+
+func formRect(get func(string) string) (crop.Rect, error) {
+	var c crop.Rect
+	for _, f := range []struct {
+		dst  *int
+		name string
+	}{{&c.X, "x"}, {&c.Y, "y"}, {&c.W, "w"}, {&c.H, "h"}} {
+		v, err := strconv.Atoi(get(f.name))
+		if err != nil {
+			return c, session.ErrBadCrop
+		}
+		*f.dst = v
+	}
+	return c, nil
+}
+
 // pageImage serves a page's thumbnail, or its image as it goes into the PDF
-// (cropped). ?full=1 serves the whole original for the crop editor. Pages
-// link with ?v=<Page.Rev>; only a response for the current revision (or the
-// original) may be cached, as a stale ?v gets the current rendering.
+// (rotated and cropped). ?full=1 serves the whole page for the crop editor,
+// turned by ?turns= and ?angle= (as scanned without them). Pages link with
+// ?v=<Page.Rev>; only a response for the current revision (or a full one)
+// may be cached, as a stale ?v gets the current rendering.
 func (s *Server) pageImage(thumb bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		m, err := s.d.Store.Get(r.PathValue("id"))
@@ -612,8 +666,17 @@ func (s *Server) pageImage(thumb bool) http.HandlerFunc {
 			return
 		}
 		p := m.Pages[i]
-		full := r.URL.Query().Get("full") == "1"
-		if full || r.URL.Query().Get("v") == p.Rev() {
+		q := r.URL.Query()
+		full := q.Get("full") == "1"
+		rot, c := p.Rotation, p.Crop
+		if full {
+			if rot, err = formRotation(q.Get, crop.Rotation{}); err != nil {
+				http.Error(w, "bad rotation", http.StatusBadRequest)
+				return
+			}
+			c = nil
+		}
+		if full || q.Get("v") == p.Rev() {
 			w.Header().Set("Cache-Control", "private, max-age=86400, immutable")
 		} else {
 			w.Header().Set("Cache-Control", "no-store")
@@ -622,16 +685,13 @@ func (s *Server) pageImage(thumb bool) http.HandlerFunc {
 		case thumb && p.Thumb != "":
 			w.Header().Set("Content-Type", "image/jpeg")
 			http.ServeFile(w, r, s.d.Store.ThumbPath(m.ID, p))
-		case p.MIME == "image/jpeg" && (full || p.Crop == nil):
+		case p.MIME == "image/jpeg" && c == nil && rot.IsZero():
 			w.Header().Set("Content-Type", p.MIME)
 			http.ServeFile(w, r, s.d.Store.PagePath(m.ID, p))
 		default:
-			// Cropped pages, and TIFF (which browsers can't show), are rendered.
-			c := p.Crop
-			if full {
-				c = nil
-			}
-			b, err := renderJPEG(s.d.Store.PagePath(m.ID, p), c, previewMax)
+			// Turned or cropped pages, and TIFF (which browsers can't
+			// show), are rendered.
+			b, err := renderJPEG(s.d.Store.PagePath(m.ID, p), rot, c, previewMax)
 			if err != nil {
 				s.log.Warn("render page image", "session", m.ID, "file", p.File, "err", err)
 				http.NotFound(w, r)
@@ -647,7 +707,7 @@ func (s *Server) pageImage(thumb bool) http.HandlerFunc {
 // up to 600 dpi; a phone doesn't need them whole).
 const previewMax = 2400
 
-func renderJPEG(path string, c *crop.Rect, maxSide int) ([]byte, error) {
+func renderJPEG(path string, rot crop.Rotation, c *crop.Rect, maxSide int) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -657,20 +717,39 @@ func renderJPEG(path string, c *crop.Rect, maxSide int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if c != nil {
-		img = crop.Apply(img, *c)
+	// A fine turn resamples the whole page: shrink it first (and the crop
+	// with it) rather than turn pixels nobody will see. With a crop, shrink
+	// only as far as the output limit allows for the cropped part, so a
+	// small crop keeps its detail.
+	if b := img.Bounds(); rot.Angle != 0 {
+		long := max(b.Dx(), b.Dy())
+		if c != nil {
+			long = max(c.W, c.H)
+		}
+		if long > maxSide {
+			k := float64(maxSide) / float64(long)
+			img = scale(img, int(float64(b.Dx())*k), int(float64(b.Dy())*k))
+			if c != nil {
+				c = &crop.Rect{X: int(float64(c.X) * k), Y: int(float64(c.Y) * k), W: int(math.Ceil(float64(c.W) * k)), H: int(math.Ceil(float64(c.H) * k))}
+			}
+		}
 	}
-	b := img.Bounds()
-	if long := max(b.Dx(), b.Dy()); long > maxSide {
-		dst := image.NewRGBA(image.Rect(0, 0, b.Dx()*maxSide/long, b.Dy()*maxSide/long))
-		draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, b, draw.Src, nil)
-		img = dst
+	img = crop.View(img, rot, c)
+	if b := img.Bounds(); max(b.Dx(), b.Dy()) > maxSide {
+		long := max(b.Dx(), b.Dy())
+		img = scale(img, b.Dx()*maxSide/long, b.Dy()*maxSide/long)
 	}
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func scale(img image.Image, w, h int) image.Image {
+	dst := image.NewRGBA(image.Rect(0, 0, max(1, w), max(1, h)))
+	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, img.Bounds(), draw.Src, nil)
+	return dst
 }
 
 // sessionPDF downloads the merged PDF of a session (read-only: the session

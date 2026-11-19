@@ -50,23 +50,37 @@
     {{template "pages" .}}
   </section>
 
-  <div class="cropper" x-ref="cropper" x-show="cropOpen" x-cloak @keydown.escape.window="closeCrop" role="dialog" aria-modal="true" aria-label="Crop page">
+  <div class="cropper" x-ref="cropper" x-show="cropOpen" x-cloak @keydown.escape.window="closeCrop" role="dialog" aria-modal="true" aria-label="Crop &amp; rotate page">
     <form class="cropper-panel" hx-post="/sessions/{{.M.ID}}/crop" hx-target="#pages" hx-disable="find button" @submit="cropBusy" @htmx:finally:request="closeCrop">
       <input type="hidden" name="file" x-ref="cropFile">
       <input type="hidden" name="action" x-ref="cropAction" value="save">
+      <input type="hidden" name="turns" x-ref="cropTurns"><input type="hidden" name="angle" x-ref="cropAngle">
       <input type="hidden" name="x" x-ref="cropX"><input type="hidden" name="y" x-ref="cropY">
       <input type="hidden" name="w" x-ref="cropW"><input type="hidden" name="h" x-ref="cropH">
-      <p class="cropper-hint">Drag the frame or its corners. Draw a new one anywhere on the page.</p>
+      <p class="cropper-hint">Drag the frame or its corners. Draw a new one anywhere on the page. Line the text up with the grid to straighten it.</p>
       <div class="cropper-stage" x-ref="cropStage" @pointerdown="cropDown">
-        <img x-ref="cropImg" alt="Page to crop" draggable="false">
+        <div class="cropper-clip"><img x-ref="cropImg" alt="Page to crop" draggable="false" @load="cropLoaded" @error="cropFailed"></div>
+        <div class="cropper-grid" x-show="gridOn" x-cloak></div>
         <div class="cropper-shade"><div class="cropper-hole" x-ref="cropHole"></div></div>
         <div class="cropper-box" x-ref="cropBox" data-mode="move">
           <span class="cropper-h" data-mode="nw"></span><span class="cropper-h" data-mode="ne"></span>
           <span class="cropper-h" data-mode="sw"></span><span class="cropper-h" data-mode="se"></span>
         </div>
       </div>
+      <div class="cropper-rotate" role="group" aria-label="Rotate">
+        <button type="button" class="link-btn" @click="turnBy" data-by="-1" aria-label="Rotate left a quarter turn" title="Rotate left">⟲</button>
+        <button type="button" class="link-btn" @click="tiltBy" data-by="-1" aria-label="Tilt left 1°">−1°</button>
+        <button type="button" class="link-btn" @click="tiltBy" data-by="-0.1" aria-label="Tilt left 0.1°">−.1</button>
+        <label class="cropper-angle"><span class="visually-hidden">Straighten angle</span>
+          <input type="range" min="-15" max="15" step="0.1" value="0" x-ref="cropRange" @input="tiltTo" :aria-valuetext="angleLabel"></label>
+        <button type="button" class="link-btn" @click="tiltBy" data-by="0.1" aria-label="Tilt right 0.1°">+.1</button>
+        <button type="button" class="link-btn" @click="tiltBy" data-by="1" aria-label="Tilt right 1°">+1°</button>
+        <button type="button" class="link-btn" @click="turnBy" data-by="1" aria-label="Rotate right a quarter turn" title="Rotate right">⟳</button>
+        <button type="button" class="link-btn cropper-level" @click="level" aria-label="Reset tilt to 0°" x-text="angleLabel">0°</button>
+      </div>
       <div class="cropper-actions">
-        <button type="submit" class="link-btn primary" x-ref="cropSave" @click="setCropAction" data-action="save">Save crop</button>
+        <button type="submit" class="link-btn primary" x-ref="cropSave" @click="setCropAction" data-action="save">Save</button>
+        <button type="submit" class="link-btn" @click="setCropAction" data-action="straighten">Straighten</button>
         <button type="submit" class="link-btn" @click="setCropAction" data-action="auto">Detect document</button>
         <button type="submit" class="link-btn" @click="setCropAction" data-action="reset">Whole page</button>
         <button type="button" class="link-btn" @click="closeCrop">Cancel</button>

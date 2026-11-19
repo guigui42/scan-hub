@@ -1,11 +1,13 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
 	"image/jpeg"
 	"io"
 	"io/fs"
@@ -15,12 +17,14 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/guigui42/scan-hub/internal/crop"
 	"github.com/guigui42/scan-hub/internal/escl"
 	"github.com/guigui42/scan-hub/internal/escl/escltest"
 	"github.com/guigui42/scan-hub/internal/paperless"
@@ -679,5 +683,95 @@ func TestAutoCropAndCropEditor(t *testing.T) {
 	want := fmt.Sprintf("/MediaBox [0 0 %.2f %.2f]", float64(c.W)*72/100, float64(c.H)*72/100)
 	if !strings.Contains(pdfBody, want) {
 		t.Fatalf("PDF lacks %q", want)
+	}
+}
+
+func TestRotateAndStraightenEditor(t *testing.T) {
+	r := newRig(t)
+	r.ep.SetTilt(3)
+	r.get("/")
+	_, _, h := r.send("POST", "/sessions", nil, nil)
+	sid := strings.TrimPrefix(h.Get("HX-Redirect"), "/sessions/")
+	code, body, _ := r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"glass"}, "color": {"color"}, "dpi": {"300"}, "region": {"a4"}}, nil)
+	if code != http.StatusAccepted {
+		t.Fatalf("scan %d %s", code, body)
+	}
+	waitJob(t, r, body)
+	m, _ := r.store.Get(sid)
+	p := m.Pages[0]
+	edit := func(v url.Values) (int, string) {
+		v.Set("file", p.File)
+		code, body, _ := r.send("POST", "/sessions/"+sid+"/crop", v, nil)
+		return code, body
+	}
+
+	if code, body := edit(url.Values{"action": {"straighten"}, "turns": {"0"}, "angle": {"0"}}); code != 200 || !strings.Contains(body, ">straightened<") || !strings.Contains(body, "data-crop=") {
+		t.Fatalf("straighten %d %s", code, body)
+	}
+	m, _ = r.store.Get(sid)
+	if a := m.Pages[0].Angle; a > -2.7 || a < -3.3 {
+		t.Fatalf("straightened by %v°, want about -3", a)
+	}
+
+	// A quarter turn, framing the whole turned page (one rounding pixel over).
+	code, body = edit(url.Values{"action": {"save"}, "turns": {"1"}, "angle": {"0"}, "x": {"0"}, "y": {"0"}, "w": {"1170"}, "h": {"827"}})
+	if code != 200 || !strings.Contains(body, ">rotated<") || strings.Contains(body, "data-crop=") || !strings.Contains(body, `data-turns="1"`) {
+		t.Fatalf("turn %d %s", code, body)
+	}
+	if code, body := edit(url.Values{"action": {"reset"}, "turns": {"0"}, "angle": {"60"}}); code != 422 || !strings.Contains(body, "doesn&#39;t fit") {
+		t.Fatalf("out-of-range angle %d %s", code, body)
+	}
+
+	// The editor fetches the page turned as it previews it.
+	for _, c := range []struct {
+		q    string
+		w, h int
+	}{{"", 827, 1169}, {"&turns=1", 1169, 827}, {"&angle=10", 0, 0}} {
+		w, h := c.w, c.h
+		if w == 0 {
+			w, h = crop.Rotation{Angle: 10}.Size(827, 1169)
+		}
+		code, img, _ := r.get("/sessions/" + sid + "/pages/" + p.File + "/image?full=1" + c.q)
+		cfg, err := jpeg.DecodeConfig(strings.NewReader(img))
+		if code != 200 || err != nil || cfg.Width != w || cfg.Height != h {
+			t.Fatalf("full%s: %d %v %dx%d, want %dx%d", c.q, code, err, cfg.Width, cfg.Height, w, h)
+		}
+	}
+	if code, _, _ := r.get("/sessions/" + sid + "/pages/" + p.File + "/image?full=1&turns=7"); code != 400 {
+		t.Fatalf("bad turns %d", code)
+	}
+}
+
+// A small crop of a tilted page keeps its full detail; only the uncropped
+// page shrinks to the preview limit.
+func TestRenderJPEGTiltedCropKeepsDetail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "page.jpg")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jpeg.Encode(f, image.NewGray(image.Rect(0, 0, 1500, 2000)), nil); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	dims := func(c *crop.Rect) (int, int) {
+		b, err := renderJPEG(path, crop.Rotation{Angle: 2}, c, 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := jpeg.DecodeConfig(bytes.NewReader(b))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.Width, cfg.Height
+	}
+	if w, h := dims(&crop.Rect{X: 500, Y: 500, W: 400, H: 300}); w < 398 || w > 400 || h < 298 || h > 300 {
+		t.Errorf("small crop rendered %dx%d, want about 400x300", w, h)
+	}
+	if w, h := dims(&crop.Rect{X: 100, Y: 100, W: 1000, H: 1500}); max(w, h) != 500 || w < 331 || w > 335 {
+		t.Errorf("large crop rendered %dx%d, want about 333x500", w, h)
+	}
+	if w, h := dims(nil); max(w, h) > 500 {
+		t.Errorf("whole page rendered %dx%d, want at most 500", w, h)
 	}
 }

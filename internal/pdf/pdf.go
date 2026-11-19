@@ -1,7 +1,7 @@
 // Package pdf merges scanned pages into one PDF. JPEG pages are embedded
-// unchanged (DCT passthrough) unless cropped, when the kept part is
+// unchanged (DCT passthrough) unless rotated or cropped, when the result is
 // re-encoded; TIFF pages (ScanSnap B&W) become 1-bit PNGs. Each page is sized
-// from its pixel dimensions (after the crop) and DPI.
+// from its pixel dimensions (after rotation and crop) and DPI.
 package pdf
 
 import (
@@ -25,12 +25,13 @@ import (
 // Page is one input image on disk.
 type Page struct {
 	Path string
-	MIME string     // image/jpeg or image/tiff
-	DPI  int        // 0 = DefaultDPI
-	Crop *crop.Rect // nil = whole image
+	MIME string // image/jpeg or image/tiff
+	DPI  int    // 0 = DefaultDPI
+	Rot  crop.Rotation
+	Crop *crop.Rect // of the rotated image; nil = whole image
 }
 
-// CropQuality is the JPEG quality of re-encoded cropped pages.
+// CropQuality is the JPEG quality of re-encoded rotated or cropped pages.
 const CropQuality = 90
 
 // DefaultDPI is used when a page carries no resolution.
@@ -89,12 +90,12 @@ func load(p Page) (imgType string, body io.Reader, w, h int, err error) {
 		return "", nil, 0, 0, err
 	}
 	switch {
-	case p.MIME == "image/jpeg" && p.Crop != nil:
+	case p.MIME == "image/jpeg" && (p.Crop != nil || !p.Rot.IsZero()):
 		img, err := jpeg.Decode(bytes.NewReader(data))
 		if err != nil {
 			return "", nil, 0, 0, err
 		}
-		if img, err = cropped(img, p.Crop); err != nil {
+		if img, err = view(img, p); err != nil {
 			return "", nil, 0, 0, err
 		}
 		var buf bytes.Buffer
@@ -114,7 +115,7 @@ func load(p Page) (imgType string, body io.Reader, w, h int, err error) {
 		if err != nil {
 			return "", nil, 0, 0, fmt.Errorf("decode TIFF: %w", err)
 		}
-		if img, err = cropped(img, p.Crop); err != nil {
+		if img, err = view(img, p); err != nil {
 			return "", nil, 0, 0, err
 		}
 		var buf bytes.Buffer
@@ -127,7 +128,13 @@ func load(p Page) (imgType string, body io.Reader, w, h int, err error) {
 	return "", nil, 0, 0, fmt.Errorf("unsupported type %q", p.MIME)
 }
 
-func cropped(img image.Image, r *crop.Rect) (image.Image, error) {
+// view turns img by the page's rotation, then crops it.
+func view(img image.Image, p Page) (image.Image, error) {
+	if !p.Rot.Valid() {
+		return nil, fmt.Errorf("rotation %+v out of range", p.Rot)
+	}
+	img = crop.Rotate(img, p.Rot)
+	r := p.Crop
 	if r == nil {
 		return img, nil
 	}

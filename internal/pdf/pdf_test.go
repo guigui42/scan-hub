@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -117,6 +118,38 @@ func TestCroppedPages(t *testing.T) {
 	pages[0].Crop = &crop.Rect{X: 100, Y: 0, W: 60, H: 30}
 	if err := Write(&bytes.Buffer{}, pages[:1], Options{}); err == nil {
 		t.Fatal("crop outside the image accepted")
+	}
+}
+
+func TestRotatedPages(t *testing.T) {
+	dir := t.TempDir()
+	colour := venstest.PageJPEG(0, 0) // 120x170
+	pages := []Page{
+		// A quarter turn makes it landscape; the crop is of the turned page.
+		{Path: writeFile(t, dir, "a.jpg", colour), MIME: "image/jpeg", DPI: 300, Rot: crop.Rotation{Turns: 1}, Crop: &crop.Rect{X: 0, Y: 0, W: 150, H: 100}},
+		{Path: writeFile(t, dir, "b.jpg", colour), MIME: "image/jpeg", DPI: 300, Rot: crop.Rotation{Angle: 30}},
+		{Path: writeFile(t, dir, "c.tif", bwTIFF(240, 340)), MIME: "image/tiff", Rot: crop.Rotation{Turns: 3}},
+	}
+	var out bytes.Buffer
+	if err := Write(&out, pages, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	b := out.Bytes()
+	w, h := crop.Rotation{Angle: 30}.Size(120, 170)
+	pt := func(px int) string { return strconv.FormatFloat(float64(px)/300*72, 'f', 2, 64) }
+	boxes := regexp.MustCompile(`/MediaBox \[0 0 ([0-9.]+) ([0-9.]+)\]`).FindAllStringSubmatch(string(b), -1)
+	want := [][2]string{{pt(150), pt(100)}, {pt(w), pt(h)}, {pt(340), pt(240)}}
+	for i, w := range want {
+		if boxes[i][1] != w[0] || boxes[i][2] != w[1] {
+			t.Fatalf("page %d box %v, want %v", i+1, boxes[i][1:], w)
+		}
+	}
+	if bytes.Contains(b, colour) {
+		t.Fatal("rotated JPEG embedded as scanned")
+	}
+	pages[0].Rot.Angle = 90
+	if err := Write(&bytes.Buffer{}, pages[:1], Options{}); err == nil {
+		t.Fatal("out-of-range rotation accepted")
 	}
 }
 

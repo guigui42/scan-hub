@@ -128,3 +128,39 @@ func TestApplyAndValid(t *testing.T) {
 		}
 	}
 }
+
+// A lid that lets light in shades the glass from one corner, by more than
+// the content threshold; the crop must keep to the document (seen on an
+// ET-2750 with a passport).
+func TestDetectIgnoresLidShading(t *testing.T) {
+	img := a4()
+	for y := range 1169 {
+		for x := range 827 {
+			d := max(0, 400-x-y) * 70 / 400 // darkest (180) at the top-left corner
+			img.Set(x, y, color.RGBA{uint8(250 - d), uint8(250 - d), uint8(248 - d), 255})
+		}
+	}
+	card := image.Rect(300, 400, 637, 613)
+	fill(img, card, color.RGBA{180, 200, 230, 255})
+	r, ok := Detect(img, 100)
+	if !ok {
+		t.Fatal("no crop")
+	}
+	near(t, r, card.Inset(-11), 6)
+}
+
+// A grey document running off the glass keeps all of it, faint marks
+// included, though most of it is flat (no sharp marks nearby).
+func TestDetectKeepsFlatDocumentAtTheEdge(t *testing.T) {
+	img := a4()
+	doc := image.Rect(0, 0, 600, 1169)
+	fill(img, doc, color.Gray{210})
+	fill(img, image.Rect(20, 500, 60, 503), color.Gray{190}) // faint pencil
+	for i := range 8 {
+		fill(img, image.Rect(100, 100+i*30, 500, 108+i*30), color.Black)
+	}
+	r, ok := Detect(img, 100)
+	if !ok || r.X != 0 || r.X+r.W < 600 {
+		t.Fatalf("crop %+v, %v; want the whole document, 0..611", r, ok)
+	}
+}
