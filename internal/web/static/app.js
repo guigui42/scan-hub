@@ -45,6 +45,7 @@ document.addEventListener('alpine:init', () => {
     // Crop editor. The frame is kept in fractions of the page (0..1) and
     // posted in pixels of the original image.
     cropOpen: false,
+    cropPending: false,
     page: { w: 0, h: 0 },
     frame: { x: 0, y: 0, w: 1, h: 1 },
 
@@ -58,9 +59,34 @@ document.addEventListener('alpine:init', () => {
       this.$refs.cropAction.value = 'save'
       this.$refs.cropImg.src = d.src
       this.cropOpen = true
+      this.cropPending = false
       this.drawCrop()
+      this.setInert(true)
+      this.$nextTick(() => this.$refs.cropSave.focus())
     },
-    closeCrop() { this.cropOpen = false },
+    // The editor stays open until its request finishes, so the old crop
+    // can't be downloaded or sent meanwhile.
+    cropBusy() { this.cropPending = true },
+    closeCrop(e) {
+      if (!this.cropOpen) return
+      if (this.cropPending && e && e.type !== 'htmx:finally:request') return
+      this.cropOpen = false
+      this.cropPending = false
+      this.setInert(false)
+      const file = this.$refs.cropFile.value
+      this.$nextTick(() => {
+        const btn = [...document.querySelectorAll('.sheet-crop')].find((b) => b.dataset.file === file)
+        if (btn) btn.focus()
+      })
+    },
+    // A modal dialog: everything outside it is inert while it's open.
+    setInert(on) {
+      for (let el = this.$refs.cropper; el && el !== document.body; el = el.parentElement) {
+        for (const sib of el.parentElement.children) {
+          if (sib !== el) sib.inert = on
+        }
+      }
+    },
     setCropAction(e) { this.$refs.cropAction.value = e.currentTarget.dataset.action },
 
     cropDown(e) {

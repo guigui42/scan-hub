@@ -185,6 +185,8 @@ test('auto-crop trims the glass; the crop editor adjusts and resets it', async (
   await page.getByRole('button', { name: 'Crop page 1' }).click()
   const editor = page.getByRole('dialog', { name: 'Crop page' })
   await expect(editor).toBeVisible()
+  await expect(editor.getByRole('button', { name: 'Save crop' })).toBeFocused()
+  await expect(page.locator('#pages')).toHaveJSProperty('inert', true)
   await expect(editor.locator('img')).toHaveJSProperty('complete', true)
   const handle = editor.locator('.cropper-h[data-mode="se"]')
   const box = (await handle.boundingBox())!
@@ -195,6 +197,8 @@ test('auto-crop trims the glass; the crop editor adjusts and resets it', async (
   await editor.getByRole('button', { name: 'Save crop' }).click()
   await expect(editor).toBeHidden()
   await expect.poll(cropOf).not.toBe(detected)
+  await expect(page.getByRole('button', { name: 'Crop page 1' })).toBeFocused()
+  await expect(page.locator('#pages')).toHaveJSProperty('inert', false)
 
   await page.getByRole('button', { name: 'Crop page 1' }).click()
   await editor.getByRole('button', { name: 'Whole page' }).click()

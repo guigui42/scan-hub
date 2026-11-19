@@ -50,8 +50,8 @@
     {{template "pages" .}}
   </section>
 
-  <div class="cropper" x-show="cropOpen" x-cloak @keydown.escape.window="closeCrop" role="dialog" aria-modal="true" aria-label="Crop page">
-    <form class="cropper-panel" hx-post="/sessions/{{.M.ID}}/crop" hx-target="#pages" @submit="closeCrop">
+  <div class="cropper" x-ref="cropper" x-show="cropOpen" x-cloak @keydown.escape.window="closeCrop" role="dialog" aria-modal="true" aria-label="Crop page">
+    <form class="cropper-panel" hx-post="/sessions/{{.M.ID}}/crop" hx-target="#pages" hx-disable="find button" @submit="cropBusy" @htmx:finally:request="closeCrop">
       <input type="hidden" name="file" x-ref="cropFile">
       <input type="hidden" name="action" x-ref="cropAction" value="save">
       <input type="hidden" name="x" x-ref="cropX"><input type="hidden" name="y" x-ref="cropY">
@@ -66,7 +66,7 @@
         </div>
       </div>
       <div class="cropper-actions">
-        <button type="submit" class="link-btn primary" @click="setCropAction" data-action="save">Save crop</button>
+        <button type="submit" class="link-btn primary" x-ref="cropSave" @click="setCropAction" data-action="save">Save crop</button>
         <button type="submit" class="link-btn" @click="setCropAction" data-action="auto">Detect document</button>
         <button type="submit" class="link-btn" @click="setCropAction" data-action="reset">Whole page</button>
         <button type="button" class="link-btn" @click="closeCrop">Cancel</button>
