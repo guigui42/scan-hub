@@ -35,13 +35,15 @@ func (r Rect) Valid(w, h int) bool {
 func (r Rect) Full(w, h int) bool { return r == Rect{0, 0, w, h} }
 
 const (
-	workSize = 600 // longest side of the sampling grid, in samples
-	darkStep = 28  // luminance drop below the background that counts as content
-	chroma   = 24  // channel spread that counts as content (colour on white)
-	edgeMM   = 1.5 // ignored border: glass edges often scan as a dark line
-	padMM    = 3.0 // kept around the detected content
-	minMM    = 10  // smaller content is dust
-	keepFrac = 0.9 // a crop keeping more than this of the page isn't worth it
+	workSize  = 600 // longest side of the sampling grid, in samples
+	darkStep  = 28  // luminance drop below the background that counts as content
+	chroma    = 24  // channel spread that counts as content (colour on white)
+	edgeMM    = 1.5 // ignored border: glass edges often scan as a dark line
+	padMM     = 3.0 // kept around the detected content
+	minMM     = 10  // smaller content is dust
+	dustMM    = 2.0 // marks spanning less than this (dust, specks) are ignored
+	blobGapMM = 1.0 // marks closer than this belong together (letters, strokes)
+	keepFrac  = 0.9 // a crop keeping more than this of the page isn't worth it
 )
 
 // Detect finds the content on a light background (the scanner lid) and
@@ -94,44 +96,8 @@ func Detect(img image.Image, dpi int) (r Rect, ok bool) {
 	if 2*edge >= gw || 2*edge >= gh {
 		return Rect{}, false
 	}
-	// A row or column holds content when enough of its samples do, so
-	// specks of dust don't stretch the box.
-	rowMin, colMin := max(2, gw/200), max(2, gh/200)
-
-	y0, y1 := -1, -1
-	for gy := edge; gy < gh-edge; gy++ {
-		n := 0
-		for gx := edge; gx < gw-edge; gx++ {
-			if content(gy*gw + gx) {
-				n++
-			}
-		}
-		if n >= rowMin {
-			if y0 < 0 {
-				y0 = gy
-			}
-			y1 = gy
-		}
-	}
-	if y0 < 0 {
-		return Rect{}, false
-	}
-	x0, x1 := -1, -1
-	for gx := edge; gx < gw-edge; gx++ {
-		n := 0
-		for gy := y0; gy <= y1; gy++ {
-			if content(gy*gw + gx) {
-				n++
-			}
-		}
-		if n >= colMin {
-			if x0 < 0 {
-				x0 = gx
-			}
-			x1 = gx
-		}
-	}
-	if x0 < 0 {
+	x0, y0, x1, y1, found := blobs(gw, gh, edge, content, max(1, px(blobGapMM)/step), max(2, (px(dustMM)+step-1)/step))
+	if !found {
 		return Rect{}, false
 	}
 	// Content running into the ignored border reaches the edge.
@@ -159,6 +125,47 @@ func Detect(img image.Image, dpi int) (r Rect, ok bool) {
 		return Rect{}, false
 	}
 	return r, true
+}
+
+// blobs groups content cells (inside the ignored border) into clusters of
+// marks no more than gap cells apart and returns the box around clusters
+// spanning at least minSpan cells. Dust specks are tiny isolated clusters;
+// text, pictures, thin rules and signatures join into larger ones.
+func blobs(gw, gh, edge int, content func(int) bool, gap, minSpan int) (x0, y0, x1, y1 int, found bool) {
+	seen := make([]bool, gw*gh)
+	var stack []int
+	for start := range seen {
+		sx, sy := start%gw, start/gw
+		if seen[start] || sx < edge || sx >= gw-edge || sy < edge || sy >= gh-edge || !content(start) {
+			continue
+		}
+		bx0, by0, bx1, by1 := sx, sy, sx, sy
+		seen[start] = true
+		stack = append(stack[:0], start)
+		for len(stack) > 0 {
+			i := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			cx, cy := i%gw, i/gw
+			bx0, by0, bx1, by1 = min(bx0, cx), min(by0, cy), max(bx1, cx), max(by1, cy)
+			for ny := max(edge, cy-gap); ny <= min(gh-edge-1, cy+gap); ny++ {
+				for nx := max(edge, cx-gap); nx <= min(gw-edge-1, cx+gap); nx++ {
+					if j := ny*gw + nx; !seen[j] && content(j) {
+						seen[j] = true
+						stack = append(stack, j)
+					}
+				}
+			}
+		}
+		if max(bx1-bx0, by1-by0)+1 < minSpan {
+			continue
+		}
+		if !found {
+			x0, y0, x1, y1, found = bx0, by0, bx1, by1, true
+			continue
+		}
+		x0, y0, x1, y1 = min(x0, bx0), min(y0, by0), max(x1, bx1), max(y1, by1)
+	}
+	return x0, y0, x1, y1, found
 }
 
 // eachPixel calls fn with every pixel's 8-bit RGB, relative to the image

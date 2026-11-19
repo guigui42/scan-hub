@@ -42,6 +42,24 @@ func TestDetectCard(t *testing.T) {
 	near(t, r, card.Inset(-pad), 6)
 }
 
+// Real glass scans carry dust specks all over; they must not stretch the
+// box (seen on an ET-2750 at 300 dpi).
+func TestDetectIgnoresDust(t *testing.T) {
+	img := a4()
+	card := image.Rect(0, 0, 337, 213)
+	fill(img, card, color.RGBA{150, 170, 200, 255})
+	for _, p := range []image.Point{{650, 200}, {20, 650}, {300, 700}, {60, 900}, {700, 1100}, {400, 1150}, {25, 1100}, {26, 1120}} {
+		fill(img, image.Rect(p.X, p.Y, p.X+3, p.Y+2), color.Black)
+	}
+	r, ok := Detect(img, 100)
+	if !ok {
+		t.Fatal("no crop")
+	}
+	if r.X+r.W > 360 || r.Y+r.H > 240 {
+		t.Fatalf("crop %v stretched by dust", r)
+	}
+}
+
 func TestDetectCardInCornerIgnoresGlassEdge(t *testing.T) {
 	img := a4()
 	card := image.Rect(0, 0, 337, 213)
