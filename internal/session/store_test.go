@@ -13,6 +13,8 @@ import (
 
 	"golang.org/x/image/tiff"
 
+	"github.com/guigui42/scan-hub/internal/crop"
+	"github.com/guigui42/scan-hub/internal/escl/escltest"
 	"github.com/guigui42/scan-hub/internal/vens/venstest"
 )
 
@@ -196,5 +198,70 @@ func TestDeleteIfUnchanged(t *testing.T) {
 	}
 	if _, err := s.Get(m.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatal("not deleted")
+	}
+}
+
+func TestCrop(t *testing.T) {
+	s := open(t, Options{ThumbWidth: 100})
+	m, _ := s.Create("ui")
+	img := escltest.GlassJPEG()
+	p, err := s.AddPage(m.ID, img, "glass", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.DPI != 100 || p.Crop != nil || p.Rev() != "full" {
+		t.Fatalf("page %+v", p)
+	}
+
+	got, ok, err := s.AutoCrop(m.ID, p.File)
+	if err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	c := got.Pages[0].Crop
+	// The card spans 24..361 × 24..237; 3 mm of padding is 11 px at 100 dpi.
+	if c == nil || c.X != 13 || c.Y != 13 || c.X+c.W < 361 || c.X+c.W > 380 || c.Y+c.H < 237 || c.Y+c.H > 256 {
+		t.Fatalf("crop %+v", c)
+	}
+	thumbSize := func(p Page) (int, int) {
+		th, err := os.ReadFile(s.ThumbPath(m.ID, p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := jpeg.DecodeConfig(bytes.NewReader(th))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.Width, cfg.Height
+	}
+	if w, h := thumbSize(got.Pages[0]); w != 100 || h != 100*c.H/c.W {
+		t.Fatalf("thumb %dx%d for crop %+v", w, h, c)
+	}
+	if got.Pages[0].Thumb == p.Thumb {
+		t.Fatal("a cropped rendering must get its own thumbnail file")
+	}
+	if _, err := os.Stat(s.ThumbPath(m.ID, p)); !os.IsNotExist(err) {
+		t.Fatalf("old thumbnail left behind: %v", err)
+	}
+	if b, _ := os.ReadFile(s.PagePath(m.ID, got.Pages[0])); !bytes.Equal(b, img) {
+		t.Fatal("original image altered")
+	}
+
+	if _, err := s.SetCrop(m.ID, p.File, &crop.Rect{X: 800, Y: 0, W: 100, H: 100}); !errors.Is(err, ErrBadCrop) {
+		t.Fatalf("out-of-page crop: %v", err)
+	}
+	got, err = s.SetCrop(m.ID, p.File, &crop.Rect{X: 0, Y: 0, W: 827, H: 1169})
+	if err != nil || got.Pages[0].Crop != nil {
+		t.Fatalf("whole-page crop should clear: %+v %v", got.Pages[0].Crop, err)
+	}
+	if w, h := thumbSize(got.Pages[0]); w != 100 || h != 141 {
+		t.Fatalf("thumb after reset %dx%d", w, h)
+	}
+	if _, err := s.SetCrop(m.ID, "nope.jpg", nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown page: %v", err)
+	}
+
+	blank, _ := s.AddPage(m.ID, venstest.PageJPEG(0, 0), "glass", 0, 0)
+	if _, ok, err := s.AutoCrop(m.ID, blank.File); ok || err != nil {
+		t.Fatalf("full-bleed page cropped: %v %v", ok, err)
 	}
 }

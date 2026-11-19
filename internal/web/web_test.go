@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"image/jpeg"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -38,6 +40,7 @@ type rig struct {
 	c      *http.Client
 	csrf   string
 	ss     *venstest.Scanner
+	ep     *escltest.Server
 	pl     *paperlesstest.Server
 	ob     *paperless.Outbox
 	store  *session.Store
@@ -107,7 +110,7 @@ func newRig(t *testing.T) *rig {
 
 	jar, _ := cookiejar.New(nil)
 	r := &rig{t: t, srv: srv, c: &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-		ss: ss, pl: pl, ob: ob, store: store, ws: ws, origin: srv.URL}
+		ss: ss, ep: ep, pl: pl, ob: ob, store: store, ws: ws, origin: srv.URL}
 	t.Cleanup(func() {
 		srv.Close()
 		cancel()
@@ -588,5 +591,93 @@ func TestReleaseAndTakeBackFromTheDesk(t *testing.T) {
 			t.Fatal("not reclaimed after take back")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestAutoCropAndCropEditor(t *testing.T) {
+	r := newRig(t)
+	r.get("/")
+	_, _, h := r.send("POST", "/sessions", nil, nil)
+	sid := strings.TrimPrefix(h.Get("HX-Redirect"), "/sessions/")
+	if _, body, _ := r.get("/sessions/" + sid); !strings.Contains(body, ">Auto-crop<") {
+		t.Fatal("no Auto-crop area")
+	}
+	code, body, _ := r.send("POST", "/sessions/"+sid+"/scan", url.Values{"scanner": {"glass"}, "color": {"color"}, "dpi": {"300"}, "region": {"auto"}}, nil)
+	if code != http.StatusAccepted {
+		t.Fatalf("scan %d %s", code, body)
+	}
+	waitJob(t, r, body)
+	if b := r.ep.LastSettings(); !strings.Contains(b, "<pwg:Width>2550<") {
+		t.Fatal("auto-crop must scan the whole glass")
+	}
+	m, _ := r.store.Get(sid)
+	p := m.Pages[0]
+	if p.Crop == nil {
+		t.Fatal("page not auto-cropped")
+	}
+	_, page, _ := r.get("/sessions/" + sid + "/pages")
+	if !strings.Contains(page, "thumb?v="+p.Rev()) || !strings.Contains(page, ">cropped<") || !strings.Contains(page, `data-crop="`) {
+		t.Fatalf("pages fragment:\n%s", page)
+	}
+
+	// The image is served cropped, the editor gets the original.
+	code, img, hdr := r.get("/sessions/" + sid + "/pages/" + p.File + "/image?v=" + p.Rev())
+	cfg, err := jpeg.DecodeConfig(strings.NewReader(img))
+	if code != 200 || hdr.Get("Content-Type") != "image/jpeg" || err != nil || cfg.Width != p.Crop.W || cfg.Height != p.Crop.H {
+		t.Fatalf("cropped image %d %v %+v", code, err, cfg)
+	}
+	_, full, _ := r.get("/sessions/" + sid + "/pages/" + p.File + "/image?full=1")
+	if cfg, _ := jpeg.DecodeConfig(strings.NewReader(full)); cfg.Width != p.Width {
+		t.Fatalf("full image %+v", cfg)
+	}
+
+	crop := func(v url.Values) (int, string) {
+		v.Set("file", p.File)
+		code, body, _ := r.send("POST", "/sessions/"+sid+"/crop", v, nil)
+		return code, body
+	}
+	if code, body := crop(url.Values{"action": {"save"}, "x": {"10"}, "y": {"20"}, "w": {"300"}, "h": {"200"}}); code != 200 || !strings.Contains(body, `data-crop="10,20,300,200"`) {
+		t.Fatalf("save %d %s", code, body)
+	}
+	if code, body := crop(url.Values{"action": {"save"}, "x": {"10"}, "y": {"20"}, "w": {"9999"}, "h": {"200"}}); code != 422 || !strings.Contains(body, "doesn&#39;t fit") {
+		t.Fatalf("oversized crop %d %s", code, body)
+	}
+	if code, body := crop(url.Values{"action": {"reset"}}); code != 200 || strings.Contains(body, "data-crop=") {
+		t.Fatalf("reset %d %s", code, body)
+	}
+	if code, body := crop(url.Values{"action": {"auto"}}); code != 200 || !strings.Contains(body, "data-crop=") {
+		t.Fatalf("auto %d %s", code, body)
+	}
+	if code, _, _ := r.send("POST", "/sessions/"+sid+"/crop", url.Values{"file": {"nope.jpg"}, "action": {"reset"}}, nil); code != 404 {
+		t.Fatalf("unknown page %d", code)
+	}
+
+	// Only the current revision is cacheable: a stale ?v gets today's crop.
+	m, _ = r.store.Get(sid)
+	thumb := "/sessions/" + sid + "/pages/" + p.File + "/thumb?v="
+	if _, _, h := r.get(thumb + m.Pages[0].Rev()); !strings.Contains(h.Get("Cache-Control"), "immutable") {
+		t.Fatalf("current revision not cacheable: %q", h.Get("Cache-Control"))
+	}
+	if _, _, h := r.get(thumb + "full"); h.Get("Cache-Control") != "no-store" {
+		t.Fatalf("stale revision cacheable: %q", h.Get("Cache-Control"))
+	}
+
+	// A crop waits for a send (or scan) holding the session.
+	unlock, err := r.ws.jobs.lockSession(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := crop(url.Values{"action": {"reset"}}); code != http.StatusConflict {
+		t.Fatalf("crop during send %d", code)
+	}
+	unlock()
+
+	// The PDF page is the crop: 85.6×54 mm card plus padding, at 100 dpi.
+	_, pdfBody, _ := r.get("/sessions/" + sid + "/pdf")
+	m, _ = r.store.Get(sid)
+	c := m.Pages[0].Crop
+	want := fmt.Sprintf("/MediaBox [0 0 %.2f %.2f]", float64(c.W)*72/100, float64(c.H)*72/100)
+	if !strings.Contains(pdfBody, want) {
+		t.Fatalf("PDF lacks %q", want)
 	}
 }

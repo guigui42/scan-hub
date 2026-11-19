@@ -111,6 +111,17 @@ func pdfExists(dir, id string) bool {
 	return err == nil
 }
 
+// pdfGone waits for the PDF to go: the outbox records a terminal state
+// first and only then deletes the file, so a reader can see the state early.
+func pdfGone(dir, id string) bool {
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if !pdfExists(dir, id) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestSuccessDeletesPDF(t *testing.T) {
 	e := setup(t, paperless.Options{Tags: []int{7, 9}}, nil)
 	e.fake.Set(func(s *paperlesstest.Server) { s.PendingFor = 2 })
@@ -119,7 +130,7 @@ func TestSuccessDeletesPDF(t *testing.T) {
 	if got.DocumentID == 0 {
 		t.Fatal("no document id")
 	}
-	if pdfExists(e.dir, it.ID) {
+	if !pdfGone(e.dir, it.ID) {
 		t.Fatal("PDF kept after success")
 	}
 	ups := e.fake.Uploads()
@@ -137,7 +148,7 @@ func TestDuplicateIsTerminalSuccess(t *testing.T) {
 	e.fake.Set(func(s *paperlesstest.Server) { s.Next = paperlesstest.Duplicate })
 	it := enqueue(t, e.ob, "")
 	got := wait(t, e.ob, it.ID, paperless.StateDuplicate)
-	if got.DuplicateOf != 42 || pdfExists(e.dir, it.ID) {
+	if got.DuplicateOf != 42 || !pdfGone(e.dir, it.ID) {
 		t.Fatalf("%+v pdf=%v", got, pdfExists(e.dir, it.ID))
 	}
 }
@@ -258,9 +269,15 @@ func TestBadTokenRetriesAndNeverLogsIt(t *testing.T) {
 	defer fake.Close()
 	e := start(t, fake, "wrong-token-zzz", t.TempDir(), paperless.Options{}, nil)
 	it := enqueue(t, e.ob, "")
-	time.Sleep(100 * time.Millisecond)
-	got, _ := e.ob.Get(it.ID)
-	if got.State != paperless.StatePending || !strings.Contains(got.Detail, "401") || !pdfExists(e.dir, it.ID) {
+	var got paperless.Item
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if got, _ = e.ob.Get(it.ID); got.Retries >= 2 {
+			break
+		}
+	}
+	// Between attempts the item is pending; a retry may be in flight (posting).
+	if got.Retries < 2 || (got.State != paperless.StatePending && got.State != paperless.StatePosting) ||
+		!strings.Contains(got.Detail, "401") || !pdfExists(e.dir, it.ID) {
 		t.Fatalf("%+v", got)
 	}
 	if strings.Contains(e.logs.String(), "wrong-token-zzz") {

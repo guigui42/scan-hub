@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/image/tiff"
 
+	"github.com/guigui42/scan-hub/internal/crop"
 	"github.com/guigui42/scan-hub/internal/vens/venstest"
 )
 
@@ -87,6 +88,35 @@ func TestMixedPages(t *testing.T) {
 	}
 	if !strings.Contains(string(b), "/Creator") || !bytes.Contains(b, []byte("D:20261107")) {
 		t.Fatal("metadata missing")
+	}
+}
+
+func TestCroppedPages(t *testing.T) {
+	dir := t.TempDir()
+	colour := venstest.PageJPEG(0, 0) // 120x170
+	pages := []Page{
+		{Path: writeFile(t, dir, "a.jpg", colour), MIME: "image/jpeg", DPI: 300, Crop: &crop.Rect{X: 10, Y: 20, W: 60, H: 30}},
+		{Path: writeFile(t, dir, "c.tif", bwTIFF(240, 340)), MIME: "image/tiff", Crop: &crop.Rect{X: 0, Y: 0, W: 120, H: 100}},
+	}
+	var out bytes.Buffer
+	if err := Write(&out, pages, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	b := out.Bytes()
+	// 60x30 px @300 dpi = 14.40 x 7.20 pt; 120x100 @300 = 28.80 x 24.00 pt.
+	boxes := regexp.MustCompile(`/MediaBox \[0 0 ([0-9.]+) ([0-9.]+)\]`).FindAllStringSubmatch(string(b), -1)
+	want := [][2]string{{"14.40", "7.20"}, {"28.80", "24.00"}}
+	for i, w := range want {
+		if boxes[i][1] != w[0] || boxes[i][2] != w[1] {
+			t.Fatalf("page %d box %v, want %v", i+1, boxes[i][1:], w)
+		}
+	}
+	if bytes.Contains(b, colour) {
+		t.Fatal("cropped JPEG embedded whole")
+	}
+	pages[0].Crop = &crop.Rect{X: 100, Y: 0, W: 60, H: 30}
+	if err := Write(&bytes.Buffer{}, pages[:1], Options{}); err == nil {
+		t.Fatal("crop outside the image accepted")
 	}
 }
 

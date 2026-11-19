@@ -50,6 +50,30 @@
     {{template "pages" .}}
   </section>
 
+  <div class="cropper" x-ref="cropper" x-show="cropOpen" x-cloak @keydown.escape.window="closeCrop" role="dialog" aria-modal="true" aria-label="Crop page">
+    <form class="cropper-panel" hx-post="/sessions/{{.M.ID}}/crop" hx-target="#pages" hx-disable="find button" @submit="cropBusy" @htmx:finally:request="closeCrop">
+      <input type="hidden" name="file" x-ref="cropFile">
+      <input type="hidden" name="action" x-ref="cropAction" value="save">
+      <input type="hidden" name="x" x-ref="cropX"><input type="hidden" name="y" x-ref="cropY">
+      <input type="hidden" name="w" x-ref="cropW"><input type="hidden" name="h" x-ref="cropH">
+      <p class="cropper-hint">Drag the frame or its corners. Draw a new one anywhere on the page.</p>
+      <div class="cropper-stage" x-ref="cropStage" @pointerdown="cropDown">
+        <img x-ref="cropImg" alt="Page to crop" draggable="false">
+        <div class="cropper-shade"><div class="cropper-hole" x-ref="cropHole"></div></div>
+        <div class="cropper-box" x-ref="cropBox" data-mode="move">
+          <span class="cropper-h" data-mode="nw"></span><span class="cropper-h" data-mode="ne"></span>
+          <span class="cropper-h" data-mode="sw"></span><span class="cropper-h" data-mode="se"></span>
+        </div>
+      </div>
+      <div class="cropper-actions">
+        <button type="submit" class="link-btn primary" x-ref="cropSave" @click="setCropAction" data-action="save">Save crop</button>
+        <button type="submit" class="link-btn" @click="setCropAction" data-action="auto">Detect document</button>
+        <button type="submit" class="link-btn" @click="setCropAction" data-action="reset">Whole page</button>
+        <button type="button" class="link-btn" @click="closeCrop">Cancel</button>
+      </div>
+    </form>
+  </div>
+
   <div class="lightbox" x-show="lightbox" x-cloak @click="closeLightbox" @keydown.escape.window="closeLightbox" role="dialog" aria-label="Page preview">
     <img :src="lightboxSrc" alt="">
     <button type="button" class="lightbox-x" aria-label="Close">×</button>

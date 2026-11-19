@@ -25,8 +25,13 @@ Three screens:
   **Release** (tap twice): scan-hub lets go of the scanner so another
   computer (another scan-hub, ScanSnap Home) can claim it, and stays off it,
   even across restarts, until you tap **Take back**.
-- **Session:** scan with any configured scanner, preview and delete pages,
-  title the document, and send it.
+- **Session:** scan with any configured scanner, preview, crop and delete
+  pages, title the document, and send it. On the glass, the **Auto-crop**
+  area scans the whole glass and trims the blank lid around the document
+  (an ID card, a receipt). **Crop** on any page opens an editor: drag the
+  frame or its corners, **Detect document**, or go back to the **Whole
+  page**. Crops never alter the scanned image; only the PDF and previews use
+  them.
 - **Outbox:** follow delivery; retry or discard failed documents. Filed
   documents link to Paperless and show their current Paperless title (needs
   `view_document`, see below).

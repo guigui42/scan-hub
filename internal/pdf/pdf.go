@@ -1,6 +1,7 @@
 // Package pdf merges scanned pages into one PDF. JPEG pages are embedded
-// unchanged (DCT passthrough); TIFF pages (ScanSnap B&W) become 1-bit PNGs.
-// Each page is sized from its pixel dimensions and DPI.
+// unchanged (DCT passthrough) unless cropped, when the kept part is
+// re-encoded; TIFF pages (ScanSnap B&W) become 1-bit PNGs. Each page is sized
+// from its pixel dimensions (after the crop) and DPI.
 package pdf
 
 import (
@@ -9,7 +10,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	_ "image/jpeg" // DecodeConfig
+	"image/jpeg"
 	"image/png"
 	"io"
 	"os"
@@ -17,14 +18,20 @@ import (
 
 	"codeberg.org/go-pdf/fpdf"
 	"golang.org/x/image/tiff"
+
+	"github.com/guigui42/scan-hub/internal/crop"
 )
 
 // Page is one input image on disk.
 type Page struct {
 	Path string
-	MIME string // image/jpeg or image/tiff
-	DPI  int    // 0 = DefaultDPI
+	MIME string     // image/jpeg or image/tiff
+	DPI  int        // 0 = DefaultDPI
+	Crop *crop.Rect // nil = whole image
 }
+
+// CropQuality is the JPEG quality of re-encoded cropped pages.
+const CropQuality = 90
 
 // DefaultDPI is used when a page carries no resolution.
 const DefaultDPI = 300
@@ -81,17 +88,34 @@ func load(p Page) (imgType string, body io.Reader, w, h int, err error) {
 	if err != nil {
 		return "", nil, 0, 0, err
 	}
-	switch p.MIME {
-	case "image/jpeg":
+	switch {
+	case p.MIME == "image/jpeg" && p.Crop != nil:
+		img, err := jpeg.Decode(bytes.NewReader(data))
+		if err != nil {
+			return "", nil, 0, 0, err
+		}
+		if img, err = cropped(img, p.Crop); err != nil {
+			return "", nil, 0, 0, err
+		}
+		var buf bytes.Buffer
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: CropQuality}); err != nil {
+			return "", nil, 0, 0, err
+		}
+		b := img.Bounds()
+		return "JPG", &buf, b.Dx(), b.Dy(), nil
+	case p.MIME == "image/jpeg":
 		cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
 		if err != nil {
 			return "", nil, 0, 0, err
 		}
 		return "JPG", bytes.NewReader(data), cfg.Width, cfg.Height, nil
-	case "image/tiff":
+	case p.MIME == "image/tiff":
 		img, err := tiff.Decode(bytes.NewReader(data))
 		if err != nil {
 			return "", nil, 0, 0, fmt.Errorf("decode TIFF: %w", err)
+		}
+		if img, err = cropped(img, p.Crop); err != nil {
+			return "", nil, 0, 0, err
 		}
 		var buf bytes.Buffer
 		if err := png.Encode(&buf, bitonal(img)); err != nil {
@@ -101,6 +125,16 @@ func load(p Page) (imgType string, body io.Reader, w, h int, err error) {
 		return "PNG", &buf, b.Dx(), b.Dy(), nil
 	}
 	return "", nil, 0, 0, fmt.Errorf("unsupported type %q", p.MIME)
+}
+
+func cropped(img image.Image, r *crop.Rect) (image.Image, error) {
+	if r == nil {
+		return img, nil
+	}
+	if b := img.Bounds(); !r.Valid(b.Dx(), b.Dy()) {
+		return nil, fmt.Errorf("crop %+v outside the %dx%d image", *r, b.Dx(), b.Dy())
+	}
+	return crop.Apply(img, *r), nil
 }
 
 var bw = color.Palette{color.Black, color.White}

@@ -102,8 +102,15 @@ func scanCmd(args []string) error {
 			sid = m.ID
 		}
 		pg, err := store.AddPage(sid, p.Data, id, p.Sheet, p.Side)
+		if err == nil && p.AutoCrop {
+			if m, ok, cerr := store.AutoCrop(sid, pg.File); cerr != nil {
+				log.Warn("auto-crop failed; page kept whole", "file", pg.File, "err", cerr)
+			} else if ok {
+				pg = m.Pages[len(m.Pages)-1]
+			}
+		}
 		if err == nil {
-			log.Info("page stored", "session", sid, "file", pg.File, "width", pg.Width, "height", pg.Height, "dpi", pg.DPI, "bytes", pg.Size)
+			log.Info("page stored", "session", sid, "file", pg.File, "width", pg.OutW(), "height", pg.OutH(), "dpi", pg.DPI, "bytes", pg.Size)
 		}
 		return err
 	})

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/tiff" // DecodeConfig/Decode for B&W pages
 
+	"github.com/guigui42/scan-hub/internal/crop"
 	"github.com/guigui42/scan-hub/internal/fsutil"
 )
 
@@ -34,6 +36,8 @@ var (
 	ErrLimit = errors.New("limit reached")
 	// ErrChanged is returned when a session changed since it was read.
 	ErrChanged = errors.New("session changed")
+	// ErrBadCrop is returned for a crop outside the page or too small.
+	ErrBadCrop = errors.New("invalid crop")
 )
 
 var idPattern = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$`)
@@ -54,6 +58,33 @@ type Page struct {
 	Sheet   int       `json:"sheet"`
 	Side    int       `json:"side"`
 	Added   time.Time `json:"added"`
+	// Crop is the part of the image that goes into the PDF; nil keeps the
+	// whole page. The stored image is never altered.
+	Crop *crop.Rect `json:"crop,omitempty"`
+}
+
+// OutW and OutH are the page size in pixels after its crop.
+func (p Page) OutW() int {
+	if p.Crop != nil {
+		return p.Crop.W
+	}
+	return p.Width
+}
+
+func (p Page) OutH() int {
+	if p.Crop != nil {
+		return p.Crop.H
+	}
+	return p.Height
+}
+
+// Rev identifies how the page renders, for cache busting: it changes with
+// the crop.
+func (p Page) Rev() string {
+	if p.Crop == nil {
+		return "full"
+	}
+	return fmt.Sprintf("%d-%d-%d-%d", p.Crop.X, p.Crop.Y, p.Crop.W, p.Crop.H)
 }
 
 // Manifest is the persisted state of a session.
@@ -195,8 +226,10 @@ func (s *Store) AddPage(id string, data []byte, scanner string, sheet, side int)
 		Side:    side,
 		Added:   time.Now().UTC(),
 	}
-	if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
-		p.Width, p.Height = cfg.Width, cfg.Height
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err == nil {
+		b := img.Bounds()
+		p.Width, p.Height = b.Dx(), b.Dy()
 	}
 	switch mime {
 	case "image/jpeg":
@@ -204,7 +237,10 @@ func (s *Store) AddPage(id string, data []byte, scanner string, sheet, side int)
 	case "image/tiff":
 		p.DPI = tiffDPI(data)
 	}
-	thumb := s.thumbnail(data)
+	var thumb []byte
+	if img != nil {
+		thumb = s.thumbnail(img)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -231,8 +267,8 @@ func (s *Store) AddPage(id string, data []byte, scanner string, sheet, side int)
 		return Page{}, err
 	}
 	if thumb != nil {
-		if err := fsutil.WriteFileAtomic(filepath.Join(dir, base+".thumb.jpg"), thumb, 0o600); err == nil {
-			p.Thumb = base + ".thumb.jpg"
+		if err := fsutil.WriteFileAtomic(filepath.Join(dir, thumbName(p.File, p.Rev())), thumb, 0o600); err == nil {
+			p.Thumb = thumbName(p.File, p.Rev())
 		}
 	}
 	m.Pages = append(m.Pages, p)
@@ -242,6 +278,112 @@ func (s *Store) AddPage(id string, data []byte, scanner string, sheet, side int)
 		return Page{}, err
 	}
 	return p, nil
+}
+
+// SetCrop sets the crop of the page stored as file, or clears it (r nil or
+// the whole page), and redraws its thumbnail. The image itself is kept.
+func (s *Store) SetCrop(id, file string, r *crop.Rect) (Manifest, error) {
+	p, img, err := s.pageImage(id, file)
+	if err != nil {
+		return Manifest{}, err
+	}
+	return s.setCrop(id, p, img, r)
+}
+
+// AutoCrop trims the blank glass around the page stored as file. ok is
+// false when there was nothing to trim (the page is left as it was).
+func (s *Store) AutoCrop(id, file string) (m Manifest, ok bool, err error) {
+	p, img, err := s.pageImage(id, file)
+	if err != nil {
+		return Manifest{}, false, err
+	}
+	r, ok := crop.Detect(img, p.DPI)
+	if !ok {
+		m, err = s.Get(id)
+		return m, false, err
+	}
+	m, err = s.setCrop(id, p, img, &r)
+	return m, err == nil, err
+}
+
+// pageImage decodes the original image of a page.
+func (s *Store) pageImage(id, file string) (Page, image.Image, error) {
+	m, err := s.Get(id)
+	if err != nil {
+		return Page{}, nil, err
+	}
+	i := slices.IndexFunc(m.Pages, func(p Page) bool { return p.File == file })
+	if i < 0 {
+		return Page{}, nil, ErrNotFound
+	}
+	p := m.Pages[i]
+	data, err := os.ReadFile(s.PagePath(id, p))
+	if err != nil {
+		return p, nil, err
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return p, nil, fmt.Errorf("decode page: %w", err)
+	}
+	return p, img, nil
+}
+
+func (s *Store) setCrop(id string, p Page, img image.Image, r *crop.Rect) (Manifest, error) {
+	b := img.Bounds()
+	if r != nil {
+		if !r.Valid(b.Dx(), b.Dy()) {
+			return Manifest{}, fmt.Errorf("%w: %+v on a %dx%d page", ErrBadCrop, *r, b.Dx(), b.Dy())
+		}
+		if r.Full(b.Dx(), b.Dy()) {
+			r = nil
+		}
+	}
+	view := img
+	if r != nil {
+		view = crop.Apply(img, *r)
+	}
+	thumb := s.thumbnail(view)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.load(id)
+	if err != nil {
+		return m, err
+	}
+	i := slices.IndexFunc(m.Pages, func(q Page) bool { return q.File == p.File })
+	if i < 0 {
+		return m, ErrNotFound
+	}
+	// Each rendering gets its own thumbnail file, so a cached URL never
+	// shows another crop.
+	old := m.Pages[i]
+	if thumb != nil {
+		m.Pages[i].Crop = r
+		name := thumbName(p.File, m.Pages[i].Rev())
+		if err := fsutil.WriteFileAtomic(filepath.Join(s.dir(id), name), thumb, 0o600); err != nil {
+			return m, err
+		}
+		m.Pages[i].Thumb = name
+	}
+	m.Pages[i].Crop = r
+	m.Updated = time.Now().UTC()
+	if err := s.writeManifest(m); err != nil {
+		return m, err
+	}
+	if old.Thumb != "" && old.Thumb != m.Pages[i].Thumb {
+		os.Remove(filepath.Join(s.dir(id), old.Thumb))
+	}
+	return m, nil
+}
+
+// thumbName names the thumbnail of a page rendering; the uncropped one
+// keeps the name earlier releases used.
+func thumbName(file, rev string) string {
+	base := strings.TrimSuffix(file, filepath.Ext(file))
+	if rev == "full" {
+		return base + ".thumb.jpg"
+	}
+	return base + ".thumb-" + rev + ".jpg"
 }
 
 // DeletePage removes the page stored as file from session id.
@@ -355,12 +497,8 @@ func (s *Store) writeManifest(m Manifest) error {
 	return fsutil.WriteFileAtomic(filepath.Join(s.dir(m.ID), manifestName), b, 0o600)
 }
 
-// thumbnail returns a small JPEG preview, or nil if the page can't be decoded.
-func (s *Store) thumbnail(data []byte) []byte {
-	img, _, err := image.Decode(bytes.NewReader(data))
-	if err != nil {
-		return nil
-	}
+// thumbnail returns a small JPEG preview of img, or nil.
+func (s *Store) thumbnail(img image.Image) []byte {
 	b := img.Bounds()
 	if b.Dx() == 0 || b.Dy() == 0 {
 		return nil
