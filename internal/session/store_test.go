@@ -319,4 +319,20 @@ func TestRotateAndStraighten(t *testing.T) {
 	if _, ok, err := s.Detect(m.ID, straight.File, crop.Rotation{}, true); ok || err != nil {
 		t.Fatalf("straight full-bleed page changed: %v %v", ok, err)
 	}
+	// With nothing to trim, a new quarter turn is still saved...
+	got, ok, err = s.Detect(m.ID, straight.File, crop.Rotation{Turns: 1}, false)
+	if err != nil || !ok || got.Pages[1].Turns != 1 || got.Pages[1].Crop != nil {
+		t.Fatalf("quarter turn of a full-bleed page: %+v %v %v", got.Pages[1], ok, err)
+	}
+	if _, ok, err := s.Detect(m.ID, straight.File, crop.Rotation{Turns: 1}, false); ok || err != nil {
+		t.Fatalf("same turn again changed the page: %v %v", ok, err)
+	}
+	// ...and straightening clears a saved fine angle.
+	if _, err := s.SetView(m.ID, straight.File, crop.Rotation{Angle: 2}, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err = s.Detect(m.ID, straight.File, crop.Rotation{}, true)
+	if err != nil || !ok || !got.Pages[1].Rotation.IsZero() || got.Pages[1].Crop != nil {
+		t.Fatalf("straighten kept the old angle: %+v %v %v", got.Pages[1], ok, err)
+	}
 }

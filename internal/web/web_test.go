@@ -1,11 +1,13 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
 	"image/jpeg"
 	"io"
 	"io/fs"
@@ -15,6 +17,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -736,5 +739,39 @@ func TestRotateAndStraightenEditor(t *testing.T) {
 	}
 	if code, _, _ := r.get("/sessions/" + sid + "/pages/" + p.File + "/image?full=1&turns=7"); code != 400 {
 		t.Fatalf("bad turns %d", code)
+	}
+}
+
+// A small crop of a tilted page keeps its full detail; only the uncropped
+// page shrinks to the preview limit.
+func TestRenderJPEGTiltedCropKeepsDetail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "page.jpg")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jpeg.Encode(f, image.NewGray(image.Rect(0, 0, 1500, 2000)), nil); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	dims := func(c *crop.Rect) (int, int) {
+		b, err := renderJPEG(path, crop.Rotation{Angle: 2}, c, 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := jpeg.DecodeConfig(bytes.NewReader(b))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.Width, cfg.Height
+	}
+	if w, h := dims(&crop.Rect{X: 500, Y: 500, W: 400, H: 300}); w < 398 || w > 400 || h < 298 || h > 300 {
+		t.Errorf("small crop rendered %dx%d, want about 400x300", w, h)
+	}
+	if w, h := dims(&crop.Rect{X: 100, Y: 100, W: 1000, H: 1500}); max(w, h) != 500 || w < 331 || w > 335 {
+		t.Errorf("large crop rendered %dx%d, want about 333x500", w, h)
+	}
+	if w, h := dims(nil); max(w, h) > 500 {
+		t.Errorf("whole page rendered %dx%d, want at most 500", w, h)
 	}
 }

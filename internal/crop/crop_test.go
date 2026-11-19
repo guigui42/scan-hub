@@ -148,3 +148,19 @@ func TestDetectIgnoresLidShading(t *testing.T) {
 	}
 	near(t, r, card.Inset(-11), 6)
 }
+
+// A grey document running off the glass keeps all of it, faint marks
+// included, though most of it is flat (no sharp marks nearby).
+func TestDetectKeepsFlatDocumentAtTheEdge(t *testing.T) {
+	img := a4()
+	doc := image.Rect(0, 0, 600, 1169)
+	fill(img, doc, color.Gray{210})
+	fill(img, image.Rect(20, 500, 60, 503), color.Gray{190}) // faint pencil
+	for i := range 8 {
+		fill(img, image.Rect(100, 100+i*30, 500, 108+i*30), color.Black)
+	}
+	r, ok := Detect(img, 100)
+	if !ok || r.X != 0 || r.X+r.W < 600 {
+		t.Fatalf("crop %+v, %v; want the whole document, 0..611", r, ok)
+	}
+}

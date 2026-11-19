@@ -119,3 +119,44 @@ func TestDetectTurnedIgnoresUncoveredCorners(t *testing.T) {
 		t.Fatalf("plain Detect %+v already copes: this test guards nothing", plain)
 	}
 }
+
+func TestInscribedHoldsOnlyTheScan(t *testing.T) {
+	for _, r := range []Rotation{{Angle: 2}, {Angle: -7.5}, {Turns: 1, Angle: 30}, {Turns: 3}} {
+		w, h := 827, 1169
+		in := Inscribed(r, w, h)
+		vw, vh := r.Size(w, h)
+		if !in.Valid(vw, vh) {
+			t.Fatalf("%+v: %+v outside %dx%d", r, in, vw, vh)
+		}
+		tw, th := w, h
+		if r.Turns%2 == 1 {
+			tw, th = h, w
+		}
+		// Each corner, back through the fine turn, lies on the scan.
+		s, c := math.Sin(r.Angle*math.Pi/180), math.Cos(r.Angle*math.Pi/180)
+		for _, p := range [][2]int{{in.X, in.Y}, {in.X + in.W, in.Y}, {in.X, in.Y + in.H}, {in.X + in.W, in.Y + in.H}} {
+			dx, dy := float64(p[0])-float64(vw)/2, float64(p[1])-float64(vh)/2
+			sx, sy := c*dx+s*dy+float64(tw)/2, -s*dx+c*dy+float64(th)/2
+			if sx < -0.5 || sy < -0.5 || sx > float64(tw)+0.5 || sy > float64(th)+0.5 {
+				t.Errorf("%+v: corner %v maps off the scan to (%.1f, %.1f)", r, p, sx, sy)
+			}
+		}
+		if r.Angle == 2 && in.W < 760 {
+			t.Errorf("%+v: %+v needlessly small", r, in)
+		}
+	}
+}
+
+// Lid shading alone gives nothing to straighten by.
+func TestSkewIgnoresLidShading(t *testing.T) {
+	img := a4()
+	for y := range 1169 {
+		for x := range 827 {
+			d := uint8(max(0, 400-x-y) * 70 / 400)
+			img.Set(x, y, color.Gray{250 - d})
+		}
+	}
+	if got, ok := Skew(img); ok {
+		t.Errorf("shading: Skew = %v, want none", got)
+	}
+}

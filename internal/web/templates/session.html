@@ -59,7 +59,7 @@
       <input type="hidden" name="w" x-ref="cropW"><input type="hidden" name="h" x-ref="cropH">
       <p class="cropper-hint">Drag the frame or its corners. Draw a new one anywhere on the page. Line the text up with the grid to straighten it.</p>
       <div class="cropper-stage" x-ref="cropStage" @pointerdown="cropDown">
-        <div class="cropper-clip"><img x-ref="cropImg" alt="Page to crop" draggable="false" @load="cropLoaded"></div>
+        <div class="cropper-clip"><img x-ref="cropImg" alt="Page to crop" draggable="false" @load="cropLoaded" @error="cropFailed"></div>
         <div class="cropper-grid" x-show="gridOn" x-cloak></div>
         <div class="cropper-shade"><div class="cropper-hole" x-ref="cropHole"></div></div>
         <div class="cropper-box" x-ref="cropBox" data-mode="move">

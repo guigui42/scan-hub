@@ -72,6 +72,7 @@ document.addEventListener('alpine:init', () => {
       this.gridOn = false
       this.shown = { ...this.rot }
       this.loadRot()
+      this.tiltPreview()
       this.cropOpen = true
       this.cropPending = false
       this.drawCrop()
@@ -96,13 +97,35 @@ document.addEventListener('alpine:init', () => {
     },
 
     // Size of the page once rotated, as crop.Rotation.Size computes it.
-    viewSize() {
+    viewSize(rot = this.rot) {
       let { w, h } = this.page
-      if (this.rot.turns % 2) [w, h] = [h, w]
-      const a = Math.abs(this.rot.angle) * Math.PI / 180
-      if (Math.abs(this.rot.angle) < 0.01) return { w, h }
+      if (rot.turns % 2) [w, h] = [h, w]
+      if (Math.abs(rot.angle) < 0.01) return { w, h }
+      const a = Math.abs(rot.angle) * Math.PI / 180
       const s = Math.sin(a), c = Math.cos(a)
       return { w: Math.round(w * c + h * s), h: Math.round(w * s + h * c) }
+    },
+    // The largest frame holding none of the white corners a fine turn
+    // uncovers, in fractions of the turned page (as crop.Inscribed).
+    inscribed(rot) {
+      let { w, h } = this.page
+      if (rot.turns % 2) [w, h] = [h, w]
+      if (Math.abs(rot.angle) < 0.01) return { x: 0, y: 0, w: 1, h: 1 }
+      const v = this.viewSize(rot)
+      const a = Math.abs(rot.angle) * Math.PI / 180
+      const s = Math.sin(a), c = Math.cos(a)
+      const long = Math.max(w, h), short = Math.min(w, h)
+      let iw, ih
+      if (short <= 2 * s * c * long) {
+        const x = short / 2
+        ;[iw, ih] = w >= h ? [x / s, x / c] : [x / c, x / s]
+      } else {
+        const c2 = c * c - s * s
+        ;[iw, ih] = [(w * c - h * s) / c2, (h * c - w * s) / c2]
+      }
+      iw = Math.min(v.w, Math.floor(iw) - 2)
+      ih = Math.min(v.h, Math.floor(ih) - 2)
+      return { x: (v.w - iw) / 2 / v.w, y: (v.h - ih) / 2 / v.h, w: iw / v.w, h: ih / v.h }
     },
     turnBy(e) {
       this.setRot({ turns: (this.rot.turns + Number(e.currentTarget.dataset.by) + 4) % 4, angle: this.rot.angle })
@@ -110,22 +133,46 @@ document.addEventListener('alpine:init', () => {
     tiltBy(e) { this.setRot({ ...this.rot, angle: this.rot.angle + Number(e.currentTarget.dataset.by) }) },
     tiltTo(e) { this.setRot({ ...this.rot, angle: Number(e.currentTarget.value) }) },
     level() { this.setRot({ ...this.rot, angle: 0 }) },
-    // A new rotation frames the whole page again. The loaded image turns
-    // at once (CSS) and the server's rendering follows when the angle
-    // settles, so dragging the slider stays smooth.
+    // The frame turns with the page, so a crop survives a tilt. A frame
+    // around the whole page becomes the largest one without white
+    // corners. The loaded image turns at once (CSS) and the server's
+    // rendering follows when the angle settles; meanwhile the frame hides
+    // and can't be dragged, as it no longer matches the picture.
     setRot(r) {
       r.angle = Math.round(Math.min(45, Math.max(-45, r.angle)) * 10) / 10
+      const old = this.rot, f = this.frame
+      const ov = this.viewSize(old), nv = this.viewSize(r)
+      const whole = f.x <= 0.001 && f.y <= 0.001 && f.w >= 0.999 && f.h >= 0.999
+      const wasInscribed = ['x', 'y', 'w', 'h'].every((k) => Math.abs(f[k] - this.inscribed(old)[k]) < 0.002)
+      if (whole || wasInscribed) {
+        this.frame = this.inscribed(r)
+      } else {
+        const dTurns = (r.turns - old.turns + 4) % 4
+        const d = (dTurns * 90 + r.angle - old.angle) * Math.PI / 180
+        const cx = (f.x + f.w / 2) * ov.w - ov.w / 2, cy = (f.y + f.h / 2) * ov.h - ov.h / 2
+        const nx = cx * Math.cos(d) - cy * Math.sin(d), ny = cx * Math.sin(d) + cy * Math.cos(d)
+        let fw = f.w * ov.w, fh = f.h * ov.h
+        if (dTurns % 2) [fw, fh] = [fh, fw]
+        fw = Math.min(fw, nv.w); fh = Math.min(fh, nv.h)
+        const x = Math.min(nv.w - fw, Math.max(0, nx + nv.w / 2 - fw / 2))
+        const y = Math.min(nv.h - fh, Math.max(0, ny + nv.h / 2 - fh / 2))
+        this.frame = { x: x / nv.w, y: y / nv.h, w: fw / nv.w, h: fh / nv.h }
+      }
       this.rot = r
       this.gridOn = true
-      this.frame = { x: 0, y: 0, w: 1, h: 1 }
       this.drawCrop()
       clearTimeout(this.rotTimer)
       if (r.turns !== this.shown.turns) {
         this.loadRot()
       } else {
-        this.tiltPreview()
         this.rotTimer = setTimeout(() => this.loadRot(), 350)
       }
+      this.tiltPreview()
+    },
+    // Until the matching rendering is in, the picture on screen (perhaps
+    // another page's) doesn't match the frame.
+    get previewStale() {
+      return this.loading !== null || this.rot.turns !== this.shown.turns || this.rot.angle !== this.shown.angle
     },
     loadRot() {
       this.loading = { ...this.rot }
@@ -137,9 +184,15 @@ document.addEventListener('alpine:init', () => {
       this.loading = null
       this.tiltPreview()
     },
+    cropFailed() {
+      this.loading = null
+      this.tiltPreview()
+    },
     tiltPreview() {
       const d = this.rot.turns === this.shown.turns ? this.rot.angle - this.shown.angle : 0
       this.$refs.cropImg.style.transform = d ? `rotate(${d}deg)` : ''
+      const hide = this.previewStale ? 'hidden' : ''
+      for (const el of [this.$refs.cropBox, this.$refs.cropHole]) el.style.visibility = hide
     },
 
     // A modal dialog: everything outside it is inert while it's open.
@@ -153,7 +206,7 @@ document.addEventListener('alpine:init', () => {
     setCropAction(e) { this.$refs.cropAction.value = e.currentTarget.dataset.action },
 
     cropDown(e) {
-      if (e.button !== 0) return
+      if (e.button !== 0 || this.previewStale) return
       e.preventDefault()
       const stage = e.currentTarget
       const at = (ev) => {

@@ -260,5 +260,19 @@ test('the crop editor turns, tilts and straightens a page', async ({ page }) => 
   expect(angle).toBeGreaterThan(-2.4)
   expect(angle).toBeLessThan(-1.6)
   expect(await open.getAttribute('data-turns')).toBe('1')
+
+  // A small tilt keeps the crop (turned with the page), and the frame
+  // can't be dragged until the preview catches up.
+  const crop = (await open.getAttribute('data-crop'))!.split(',').map(Number)
+  await open.click()
+  await editor.getByRole('button', { name: 'Tilt right 0.1°' }).click()
+  await expect(editor.locator('.cropper-box')).toBeHidden()
+  await expect(editor.locator('.cropper-box')).toBeVisible()
+  await editor.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(editor).toBeHidden()
+  await expect.poll(() => open.getAttribute('data-angle')).toBe(String(Math.round((angle + 0.1) * 10) / 10))
+  const kept = (await open.getAttribute('data-crop'))!.split(',').map(Number)
+  expect(Math.abs(kept[2] - crop[2])).toBeLessThan(3)
+  expect(Math.abs(kept[3] - crop[3])).toBeLessThan(3)
   expect(errors).toEqual([])
 })

@@ -718,13 +718,20 @@ func renderJPEG(path string, rot crop.Rotation, c *crop.Rect, maxSide int) ([]by
 		return nil, err
 	}
 	// A fine turn resamples the whole page: shrink it first (and the crop
-	// with it) rather than turn pixels nobody will see.
-	if b := img.Bounds(); rot.Angle != 0 && max(b.Dx(), b.Dy()) > maxSide {
+	// with it) rather than turn pixels nobody will see. With a crop, shrink
+	// only as far as the output limit allows for the cropped part, so a
+	// small crop keeps its detail.
+	if b := img.Bounds(); rot.Angle != 0 {
 		long := max(b.Dx(), b.Dy())
-		img = scale(img, b.Dx()*maxSide/long, b.Dy()*maxSide/long)
 		if c != nil {
+			long = max(c.W, c.H)
+		}
+		if long > maxSide {
 			k := float64(maxSide) / float64(long)
-			c = &crop.Rect{X: int(float64(c.X) * k), Y: int(float64(c.Y) * k), W: int(math.Ceil(float64(c.W) * k)), H: int(math.Ceil(float64(c.H) * k))}
+			img = scale(img, int(float64(b.Dx())*k), int(float64(b.Dy())*k))
+			if c != nil {
+				c = &crop.Rect{X: int(float64(c.X) * k), Y: int(float64(c.Y) * k), W: int(math.Ceil(float64(c.W) * k)), H: int(math.Ceil(float64(c.H) * k))}
+			}
 		}
 	}
 	img = crop.View(img, rot, c)

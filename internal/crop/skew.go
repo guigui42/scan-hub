@@ -52,9 +52,12 @@ func Skew(img image.Image) (angle float64, ok bool) {
 	sorted := slices.Clone(mean)
 	slices.Sort(sorted)
 	bg := int(sorted[len(sorted)*95/100])
+	// Marks stand out from what's within a few millimetres (a hundredth
+	// of the page); lid shading doesn't (see Detect).
+	local := windowMax(mean, gw, gh, max(1, max(gw, gh)/100))
 	content := func(gx, gy int) bool {
 		i := gy*gw + gx
-		return int(dark[i]) < bg-darkStep || spread[i] > chroma
+		return int(dark[i]) < min(bg, int(local[i]))-darkStep || spread[i] > chroma
 	}
 
 	// Edge cells: content next to background, away from the glass border.
@@ -98,7 +101,12 @@ func Skew(img image.Image) (angle float64, ok bool) {
 		}
 	}
 	search(-skewRange, skewRange, 0.5)
-	search(best-0.5, best+0.5, 0.05)
+	// Best at the end of the range: the true tilt is likely past it, or
+	// there is none.
+	if math.Abs(best) >= skewRange {
+		return 0, false
+	}
+	search(max(-skewRange, best-0.5), min(skewRange, best+0.5), 0.05)
 	best = math.Round(best*100) / 100
 	if math.Abs(best) < skewMin || top < skewGain*base {
 		return 0, false

@@ -339,11 +339,23 @@ func (s *Store) Detect(id, file string, rot crop.Rotation, straighten bool) (m M
 		rot.Angle, _ = crop.Skew(crop.Rotate(img, crop.Rotation{Turns: rot.Turns}))
 	}
 	view := crop.Rotate(img, rot)
+	w, h := img.Bounds().Dx(), img.Bounds().Dy()
 	var c *crop.Rect
-	if r, trimmed := crop.DetectTurned(view, p.DPI, rot, img.Bounds().Dx(), img.Bounds().Dy()); trimmed {
+	if r, trimmed := crop.DetectTurned(view, p.DPI, rot, w, h); trimmed {
+		c = &r
+	} else if !(crop.Rotation{Angle: rot.Angle}).IsZero() {
+		// Nothing to trim, but a fine turn leaves white corners: keep the
+		// largest part of the page without them.
+		r := crop.Inscribed(rot, w, h)
 		c = &r
 	}
-	if c == nil && (!straighten || rot.Angle == 0) {
+	if b := view.Bounds(); c != nil && c.Full(b.Dx(), b.Dy()) {
+		c = nil
+	}
+	// Report "nothing to do" only when the result is what is already saved.
+	sameRot := rot.Turns == p.Rotation.Turns && (crop.Rotation{Angle: rot.Angle - p.Rotation.Angle}).IsZero()
+	sameCrop := (c == nil && p.Crop == nil) || (c != nil && p.Crop != nil && *c == *p.Crop)
+	if sameRot && sameCrop {
 		m, err = s.Get(id)
 		return m, false, err
 	}

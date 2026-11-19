@@ -76,6 +76,37 @@ func Rotate(img image.Image, r Rotation) image.Image {
 	return dst
 }
 
+// Inscribed returns the largest rectangle (in pixels of the page turned by
+// r) holding only the scanned w×h page, none of the corners the turn
+// uncovers. Without a fine angle it is the whole turned page.
+func Inscribed(r Rotation, w, h int) Rect {
+	if r.Turns%2 == 1 {
+		w, h = h, w
+	}
+	vw, vh := Rotation{Angle: r.Angle}.Size(w, h)
+	if math.Abs(r.Angle) < minAngle {
+		return Rect{0, 0, w, h}
+	}
+	// Largest axis-aligned rectangle inside a w×h rectangle turned by a.
+	sin, cos := math.Abs(math.Sin(r.Angle*math.Pi/180)), math.Abs(math.Cos(r.Angle*math.Pi/180))
+	fw, fh := float64(w), float64(h)
+	long, short := max(fw, fh), min(fw, fh)
+	var iw, ih float64
+	if short <= 2*sin*cos*long || math.Abs(sin-cos) < 1e-10 {
+		x := short / 2
+		if fw >= fh {
+			iw, ih = x/sin, x/cos
+		} else {
+			iw, ih = x/cos, x/sin
+		}
+	} else {
+		c2 := cos*cos - sin*sin
+		iw, ih = (fw*cos-fh*sin)/c2, (fh*cos-fw*sin)/c2
+	}
+	cw, ch := min(vw, int(math.Floor(iw))-2), min(vh, int(math.Floor(ih))-2)
+	return Rect{X: (vw - cw) / 2, Y: (vh - ch) / 2, W: cw, H: ch}
+}
+
 // View is a page as it goes into the PDF: rotated, then cropped (c is in
 // pixels of the rotated page; nil keeps all of it).
 func View(img image.Image, r Rotation, c *Rect) image.Image {

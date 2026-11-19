@@ -135,11 +135,16 @@ func detect(img image.Image, dpi int, scanned func(x, y float64) bool) (r Rect, 
 	if len(sorted) == 0 {
 		return Rect{}, false
 	}
-	// The background is the light end of the histogram, nearby: a lid
-	// that let light in shades the glass smoothly over centimetres, while
-	// a document's edges and print stand out from what's around them.
+	// The background is the light end of the histogram.
 	slices.Sort(sorted)
 	bg := int(sorted[len(sorted)*95/100])
+	content := func(i int) bool {
+		return in[i] && (int(dark[i]) < bg-darkStep || spread[i] > chroma)
+	}
+	// A lid that lets light in shades the glass smoothly over centimetres,
+	// darker than the background yet without a single sharp mark: a
+	// region of content only counts when it holds marks that stand out
+	// from what's within a few millimetres (print, a document's edge).
 	lit := make([]uint8, gw*gh)
 	for i := range lit {
 		if in[i] {
@@ -147,7 +152,7 @@ func detect(img image.Image, dpi int, scanned func(x, y float64) bool) (r Rect, 
 		}
 	}
 	local := windowMax(lit, gw, gh, max(1, int(localMM*float64(dpi)/25.4)/step))
-	content := func(i int) bool {
+	sharp := func(i int) bool {
 		return in[i] && (int(dark[i]) < min(bg, int(local[i]))-darkStep || spread[i] > chroma)
 	}
 
@@ -156,7 +161,57 @@ func detect(img image.Image, dpi int, scanned func(x, y float64) bool) (r Rect, 
 	if 2*edge >= gw || 2*edge >= gh {
 		return Rect{}, false
 	}
-	x0, y0, x1, y1, found := blobs(gw, gh, edge, content, max(1, px(blobGapMM)/step), max(2, (px(dustMM)+step-1)/step))
+	gap, minSpan := max(1, px(blobGapMM)/step), max(2, (px(dustMM)+step-1)/step)
+	regions, regionBox := label(gw, gh, edge, content, gap)
+	marks, markBox := label(gw, gh, edge, sharp, gap)
+	// A region is a document when it holds marks and its outline against
+	// the background is mostly crisp; otherwise (shading, or shading run
+	// into a document) only its marks count.
+	marked := make([]bool, len(regionBox))
+	outline, crisp := make([]int, len(regionBox)), make([]int, len(regionBox))
+	var keepBox []box
+	for _, b := range markBox {
+		if b.span() >= minSpan {
+			keepBox = append(keepBox, b)
+		}
+	}
+	for i, k := range regions {
+		if k < 0 {
+			continue
+		}
+		if m := marks[i]; m >= 0 && markBox[m].span() >= minSpan {
+			marked[k] = true
+		}
+		x, y := i%gw, i/gw
+		for _, d := range [][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}} {
+			nx, ny := x+d[0], y+d[1]
+			if nx < edge || ny < edge || nx >= gw-edge || ny >= gh-edge {
+				continue
+			}
+			if j := ny*gw + nx; in[j] && regions[j] < 0 {
+				outline[k]++
+				// By the mean: a cell's darkest pixel is noisy.
+				if int(mean[i]) < int(local[i])-darkStep || spread[i] > chroma {
+					crisp[k]++
+				}
+				break
+			}
+		}
+	}
+	for k, b := range regionBox {
+		if marked[k] && 2*crisp[k] >= outline[k] {
+			keepBox = append(keepBox, b)
+		}
+	}
+	var x0, y0, x1, y1 int
+	found := false
+	for _, b := range keepBox {
+		if !found {
+			x0, y0, x1, y1, found = b.x0, b.y0, b.x1, b.y1, true
+			continue
+		}
+		x0, y0, x1, y1 = min(x0, b.x0), min(y0, b.y0), max(x1, b.x1), max(y1, b.y1)
+	}
 	if !found {
 		return Rect{}, false
 	}
@@ -213,45 +268,47 @@ func windowMax(v []uint8, w, h, r int) []uint8 {
 	return out
 }
 
-// blobs groups content cells (inside the ignored border) into clusters of
-// marks no more than gap cells apart and returns the box around clusters
-// spanning at least minSpan cells. Dust specks are tiny isolated clusters;
-// text, pictures, thin rules and signatures join into larger ones.
-func blobs(gw, gh, edge int, content func(int) bool, gap, minSpan int) (x0, y0, x1, y1 int, found bool) {
-	seen := make([]bool, gw*gh)
+type box struct{ x0, y0, x1, y1 int }
+
+func (b box) span() int { return max(b.x1-b.x0, b.y1-b.y0) + 1 }
+
+// label groups the content cells inside the ignored border into clusters
+// of marks no more than gap cells apart (letters, strokes and lines join;
+// dust specks stay small). It returns each cell's cluster (-1 for none)
+// and each cluster's box.
+func label(gw, gh, edge int, content func(int) bool, gap int) ([]int, []box) {
+	labels := make([]int, gw*gh)
+	for i := range labels {
+		labels[i] = -1
+	}
+	var boxes []box
 	var stack []int
-	for start := range seen {
+	for start := range labels {
 		sx, sy := start%gw, start/gw
-		if seen[start] || sx < edge || sx >= gw-edge || sy < edge || sy >= gh-edge || !content(start) {
+		if labels[start] >= 0 || sx < edge || sx >= gw-edge || sy < edge || sy >= gh-edge || !content(start) {
 			continue
 		}
-		bx0, by0, bx1, by1 := sx, sy, sx, sy
-		seen[start] = true
+		n := len(boxes)
+		b := box{sx, sy, sx, sy}
+		labels[start] = n
 		stack = append(stack[:0], start)
 		for len(stack) > 0 {
 			i := stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
 			cx, cy := i%gw, i/gw
-			bx0, by0, bx1, by1 = min(bx0, cx), min(by0, cy), max(bx1, cx), max(by1, cy)
+			b = box{min(b.x0, cx), min(b.y0, cy), max(b.x1, cx), max(b.y1, cy)}
 			for ny := max(edge, cy-gap); ny <= min(gh-edge-1, cy+gap); ny++ {
 				for nx := max(edge, cx-gap); nx <= min(gw-edge-1, cx+gap); nx++ {
-					if j := ny*gw + nx; !seen[j] && content(j) {
-						seen[j] = true
+					if j := ny*gw + nx; labels[j] < 0 && content(j) {
+						labels[j] = n
 						stack = append(stack, j)
 					}
 				}
 			}
 		}
-		if max(bx1-bx0, by1-by0)+1 < minSpan {
-			continue
-		}
-		if !found {
-			x0, y0, x1, y1, found = bx0, by0, bx1, by1, true
-			continue
-		}
-		x0, y0, x1, y1 = min(x0, bx0), min(y0, by0), max(x1, bx1), max(y1, by1)
+		boxes = append(boxes, b)
 	}
-	return x0, y0, x1, y1, found
+	return labels, boxes
 }
 
 // eachPixel calls fn with every pixel's 8-bit RGB, relative to the image
