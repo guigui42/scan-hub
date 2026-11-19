@@ -43,4 +43,4 @@ scanners:
     defaults:
       color: color             # color | gray | bw
       dpi: 300                 # 100 | 200 | 300 | 600
-      region: a4               # a4 | letter | max (whole glass)
+      region: a4               # a4 | letter | max (whole glass) | auto (whole glass, trimmed to the document)

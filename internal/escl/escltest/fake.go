@@ -2,15 +2,18 @@
 package escltest
 
 import (
+	"bytes"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/jpeg"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	"github.com/guigui42/scan-hub/internal/vens/venstest"
 )
 
 // Server is a running fake.
@@ -84,7 +87,7 @@ func Start() *Server {
 		s.jobs[id] = n + 1
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "image/jpeg")
-		w.Write(venstest.PageJPEG(n, 0))
+		w.Write(GlassJPEG())
 	})
 	mux.HandleFunc("DELETE /eSCL/ScanJobs/{id}", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
@@ -94,6 +97,28 @@ func Start() *Server {
 	})
 	s.Server = httptest.NewTLSServer(mux)
 	return s
+}
+
+// GlassJPEG is an A4 scan at 100 dpi (827×1169, JFIF density set) of an
+// ID card lying in the top-left corner of an otherwise empty glass.
+func GlassJPEG() []byte {
+	img := image.NewRGBA(image.Rect(0, 0, 827, 1169))
+	fill := func(r image.Rectangle, c color.Color) {
+		draw.Draw(img, r, image.NewUniform(c), image.Point{}, draw.Src)
+	}
+	fill(img.Bounds(), color.RGBA{250, 250, 248, 255})
+	card := image.Rect(24, 24, 361, 237) // 85.6×54 mm
+	fill(card, color.RGBA{196, 214, 236, 255})
+	fill(image.Rect(40, 70, 130, 200), color.RGBA{90, 78, 70, 255}) // photo
+	for i := range 6 {
+		fill(image.Rect(150, 80+i*20, 330-i*15, 88+i*20), color.RGBA{40, 50, 80, 255}) // text
+	}
+	var b bytes.Buffer
+	jpeg.Encode(&b, img, &jpeg.Options{Quality: 85})
+	out := b.Bytes()
+	// SOI, then a JFIF APP0 segment: version 1.1, 100×100 dots per inch.
+	app0 := []byte{0xFF, 0xE0, 0, 16, 'J', 'F', 'I', 'F', 0, 1, 1, 1, 0, 100, 0, 100, 0, 0}
+	return append(append(out[:2:2], app0...), out[2:]...)
 }
 
 // LastSettings returns the most recent ScanSettings body.

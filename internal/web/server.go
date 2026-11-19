@@ -12,17 +12,24 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"image"
+	"image/jpeg"
 	"io/fs"
 	"log/slog"
 	"mime"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
+	"golang.org/x/image/draw"
+	_ "golang.org/x/image/tiff" // B&W pages
+
+	"github.com/guigui42/scan-hub/internal/crop"
 	"github.com/guigui42/scan-hub/internal/paperless"
 	"github.com/guigui42/scan-hub/internal/pdf"
 	"github.com/guigui42/scan-hub/internal/pipeline"
@@ -113,6 +120,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /sessions/{id}/pdf", s.sessionPDF)
 	mux.HandleFunc("DELETE /sessions/{id}", s.deleteSession)
 	mux.HandleFunc("DELETE /sessions/{id}/pages/{file}", s.deletePage)
+	mux.HandleFunc("POST /sessions/{id}/crop", s.cropPage)
 	mux.HandleFunc("GET /sessions/{id}/pages/{file}/thumb", s.pageImage(true))
 	mux.HandleFunc("GET /sessions/{id}/pages/{file}/image", s.pageImage(false))
 	mux.HandleFunc("GET /jobs/{id}", s.jobFragment)
@@ -459,8 +467,14 @@ func (s *Server) startScan(w http.ResponseWriter, r *http.Request) {
 	}
 	job, err := s.jobs.start(dev.ID(), string(dev.Kind()), id, func(ctx context.Context, added func()) error {
 		err := dev.Scan(ctx, settings, func(p scanner.Page) error {
-			if _, err := s.d.Store.AddPage(id, p.Data, dev.ID(), p.Sheet, p.Side); err != nil {
+			pg, err := s.d.Store.AddPage(id, p.Data, dev.ID(), p.Sheet, p.Side)
+			if err != nil {
 				return err
+			}
+			if p.AutoCrop {
+				if _, _, err := s.d.Store.AutoCrop(id, pg.File); err != nil {
+					s.log.Warn("auto-crop failed; page kept whole", "session", id, "file", pg.File, "err", err)
+				}
 			}
 			added()
 			return nil
@@ -525,6 +539,59 @@ func (s *Server) deletePage(w http.ResponseWriter, r *http.Request) {
 	s.fragment(w, http.StatusOK, "pages", sessionView{M: m, HasOutbox: s.d.Outbox != nil})
 }
 
+// cropPage saves, detects or clears the crop of one page (form: file,
+// action=save|auto|reset, and x, y, w, h in pixels of the original for save).
+func (s *Server) cropPage(w http.ResponseWriter, r *http.Request) {
+	m, ok := s.loadSession(w, r)
+	if !ok {
+		return
+	}
+	file := r.PostFormValue("file")
+	var err error
+	switch r.PostFormValue("action") {
+	case "auto":
+		var trimmed bool
+		m, trimmed, err = s.d.Store.AutoCrop(m.ID, file)
+		if err == nil && !trimmed {
+			s.fail(w, r, http.StatusUnprocessableEntity, "Nothing to trim: no blank glass found around that page.")
+			return
+		}
+	case "reset":
+		m, err = s.d.Store.SetCrop(m.ID, file, nil)
+	case "save":
+		var c crop.Rect
+		for _, f := range []struct {
+			dst  *int
+			name string
+		}{{&c.X, "x"}, {&c.Y, "y"}, {&c.W, "w"}, {&c.H, "h"}} {
+			if *f.dst, err = strconv.Atoi(r.PostFormValue(f.name)); err != nil {
+				err = session.ErrBadCrop
+				break
+			}
+		}
+		if err == nil {
+			m, err = s.d.Store.SetCrop(m.ID, file, &c)
+		}
+	default:
+		err = session.ErrBadCrop
+	}
+	switch {
+	case errors.Is(err, session.ErrNotFound):
+		s.fail(w, r, http.StatusNotFound, "That page is gone.")
+		return
+	case errors.Is(err, session.ErrBadCrop):
+		s.fail(w, r, http.StatusUnprocessableEntity, "That crop doesn't fit the page.")
+		return
+	case err != nil:
+		s.fail(w, r, http.StatusInternalServerError, "Could not crop the page.")
+		return
+	}
+	s.fragment(w, http.StatusOK, "pages", sessionView{M: m, HasOutbox: s.d.Outbox != nil})
+}
+
+// pageImage serves a page's thumbnail, or its image as it goes into the PDF
+// (cropped). ?full=1 serves the whole original for the crop editor. URLs
+// carry ?v=<Page.Rev>, so responses can be cached for good.
 func (s *Server) pageImage(thumb bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		m, err := s.d.Store.Get(r.PathValue("id"))
@@ -532,22 +599,67 @@ func (s *Server) pageImage(thumb bool) http.HandlerFunc {
 			http.NotFound(w, r)
 			return
 		}
-		for _, p := range m.Pages {
-			if p.File != r.PathValue("file") {
-				continue
-			}
-			path, ctype := s.d.Store.PagePath(m.ID, p), p.MIME
-			// Browsers can't show TIFF: the full view of a B&W page is its thumbnail.
-			if (thumb || p.MIME == "image/tiff") && p.Thumb != "" {
-				path, ctype = s.d.Store.ThumbPath(m.ID, p), "image/jpeg"
-			}
-			w.Header().Set("Content-Type", ctype)
-			w.Header().Set("Cache-Control", "private, max-age=86400, immutable")
-			http.ServeFile(w, r, path)
+		i := slices.IndexFunc(m.Pages, func(p session.Page) bool { return p.File == r.PathValue("file") })
+		if i < 0 {
+			http.NotFound(w, r)
 			return
 		}
-		http.NotFound(w, r)
+		p := m.Pages[i]
+		full := r.URL.Query().Get("full") == "1"
+		w.Header().Set("Cache-Control", "private, max-age=86400, immutable")
+		switch {
+		case thumb && p.Thumb != "":
+			w.Header().Set("Content-Type", "image/jpeg")
+			http.ServeFile(w, r, s.d.Store.ThumbPath(m.ID, p))
+		case p.MIME == "image/jpeg" && (full || p.Crop == nil):
+			w.Header().Set("Content-Type", p.MIME)
+			http.ServeFile(w, r, s.d.Store.PagePath(m.ID, p))
+		default:
+			// Cropped pages, and TIFF (which browsers can't show), are rendered.
+			c := p.Crop
+			if full {
+				c = nil
+			}
+			b, err := renderJPEG(s.d.Store.PagePath(m.ID, p), c, previewMax)
+			if err != nil {
+				s.log.Warn("render page image", "session", m.ID, "file", p.File, "err", err)
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "image/jpeg")
+			w.Write(b)
+		}
 	}
+}
+
+// previewMax bounds the longest side of rendered page images (TIFF pages are
+// up to 600 dpi; a phone doesn't need them whole).
+const previewMax = 2400
+
+func renderJPEG(path string, c *crop.Rect, maxSide int) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return nil, err
+	}
+	if c != nil {
+		img = crop.Apply(img, *c)
+	}
+	b := img.Bounds()
+	if long := max(b.Dx(), b.Dy()); long > maxSide {
+		dst := image.NewRGBA(image.Rect(0, 0, b.Dx()*maxSide/long, b.Dy()*maxSide/long))
+		draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, b, draw.Src, nil)
+		img = dst
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // sessionPDF downloads the merged PDF of a session (read-only: the session

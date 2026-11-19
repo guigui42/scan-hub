@@ -75,6 +75,9 @@ type Page struct {
 	Data  []byte // JPEG or TIFF
 	Sheet int    // physical sheet (0-based), 0 when unknown
 	Side  int    // 0 front, 1 back
+	// AutoCrop asks the hub to trim the blank glass around the document
+	// (non-destructively, see session.Store.AutoCrop).
+	AutoCrop bool
 }
 
 // Device is one configured scanner.

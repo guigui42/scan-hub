@@ -167,3 +167,43 @@ test('a ScanSnap can be released and taken back from its card', async ({ page })
   await expect(card.locator('.stamp')).toHaveText('Ready', { timeout: 15_000 })
   expect(errors).toEqual([])
 })
+
+test('auto-crop trims the glass; the crop editor adjusts and resets it', async ({ page }) => {
+  const errors = watchErrors(page)
+  await newSession(page, 'glass')
+  await page.locator('form[data-scanner="glass"] select[name="region"]').selectOption('auto')
+  await page.getByRole('button', { name: 'Scan the glass' }).click()
+  await expect(page.locator('#job')).toContainText('1 page added', { timeout: 15_000 })
+  const sheet = page.locator('#pages .sheet').first()
+  await expect(sheet.locator('.sheet-cropped')).toBeVisible()
+  // The demo glass holds an ID card: the thumbnail is landscape, not A4.
+  expect(Number(await sheet.locator('img').getAttribute('height'))).toBeLessThan(360)
+  const cropOf = () => page.getByRole('button', { name: 'Crop page 1' }).getAttribute('data-crop')
+  const detected = await cropOf()
+
+  // Drag the bottom-right corner inwards, then save.
+  await page.getByRole('button', { name: 'Crop page 1' }).click()
+  const editor = page.getByRole('dialog', { name: 'Crop page' })
+  await expect(editor).toBeVisible()
+  await expect(editor.locator('img')).toHaveJSProperty('complete', true)
+  const handle = editor.locator('.cropper-h[data-mode="se"]')
+  const box = (await handle.boundingBox())!
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(box.x - 20, box.y - 15, { steps: 5 })
+  await page.mouse.up()
+  await editor.getByRole('button', { name: 'Save crop' }).click()
+  await expect(editor).toBeHidden()
+  await expect.poll(cropOf).not.toBe(detected)
+
+  await page.getByRole('button', { name: 'Crop page 1' }).click()
+  await editor.getByRole('button', { name: 'Whole page' }).click()
+  await expect(sheet.locator('.sheet-cropped')).toHaveCount(0)
+  expect(Number(await sheet.locator('img').getAttribute('height'))).toBeGreaterThan(500)
+
+  await page.getByRole('button', { name: 'Crop page 1' }).click()
+  await editor.getByRole('button', { name: 'Detect document' }).click()
+  await expect(sheet.locator('.sheet-cropped')).toBeVisible()
+  expect(await cropOf()).toBe(detected)
+  expect(errors).toEqual([])
+})

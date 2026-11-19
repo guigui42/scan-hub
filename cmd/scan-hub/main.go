@@ -260,8 +260,14 @@ func buttonLoop(ctx context.Context, log *slog.Logger, dev scanner.Device, b sca
 				}
 				id = m.ID
 			}
-			if _, err := store.AddPage(id, p.Data, dev.ID(), p.Sheet, p.Side); err != nil {
+			pg, err := store.AddPage(id, p.Data, dev.ID(), p.Sheet, p.Side)
+			if err != nil {
 				return err
+			}
+			if p.AutoCrop {
+				if _, _, err := store.AutoCrop(id, pg.File); err != nil {
+					log.Warn("auto-crop failed; page kept whole", "session", id, "file", pg.File, "err", err)
+				}
 			}
 			pages++
 			return nil

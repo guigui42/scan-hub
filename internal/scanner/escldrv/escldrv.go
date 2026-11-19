@@ -24,7 +24,13 @@ const Type = "escl"
 type Profile struct {
 	Color  string // color, gray, bw
 	DPI    string // 100, 200, 300, 600
-	Region string // a4, letter, max
+	Region string // a4, letter, max, auto (whole glass, then trimmed to the document)
+}
+
+// Settings are a profile ready to scan.
+type Settings struct {
+	escl.ScanSettings
+	AutoCrop bool // pages are flagged for the hub to trim blank glass
 }
 
 // DefaultProfile is used for keys missing from the scanner list.
@@ -41,10 +47,10 @@ func (p Profile) canonical() Profile {
 	return p
 }
 
-// Settings converts a profile to eSCL settings.
-func (p Profile) Settings() (escl.ScanSettings, error) {
+// Settings converts a profile to scan settings.
+func (p Profile) Settings() (Settings, error) {
 	var (
-		s    escl.ScanSettings
+		s    Settings
 		errs []error
 	)
 	switch strings.ToLower(p.Color) {
@@ -69,8 +75,10 @@ func (p Profile) Settings() (escl.ScanSettings, error) {
 	case "letter":
 		s.Region = escl.RegionLetter
 	case "max": // zero region: the whole platen
+	case "auto":
+		s.AutoCrop = true
 	default:
-		errs = append(errs, fmt.Errorf("region: want a4|letter|max, got %q", p.Region))
+		errs = append(errs, fmt.Errorf("region: want a4|letter|max|auto, got %q", p.Region))
 	}
 	return s, errors.Join(errs...)
 }
@@ -222,7 +230,7 @@ func (d *Device) Form() []scanner.Field {
 		{Name: "dpi", Label: "Resolution", Type: scanner.Select, Value: d.defaults.DPI, Options: []scanner.Option{
 			{Value: "100", Label: "100 dpi"}, {Value: "200", Label: "200 dpi"}, {Value: "300", Label: "300 dpi"}, {Value: "600", Label: "600 dpi"}}},
 		{Name: "region", Label: "Area", Type: scanner.Select, Value: d.defaults.Region, Options: []scanner.Option{
-			{Value: "a4", Label: "A4"}, {Value: "letter", Label: "Letter"}, {Value: "max", Label: "Whole glass"}}},
+			{Value: "a4", Label: "A4"}, {Value: "letter", Label: "Letter"}, {Value: "max", Label: "Whole glass"}, {Value: "auto", Label: "Auto-crop"}}},
 	}
 }
 
@@ -234,11 +242,11 @@ func (d *Device) ParseForm(get func(string) string) (scanner.Settings, error) {
 func (d *Device) DefaultSettings() Profile { return d.defaults }
 
 func (d *Device) Scan(ctx context.Context, s scanner.Settings, onPage func(scanner.Page) error) error {
-	st, ok := s.(escl.ScanSettings)
+	st, ok := s.(Settings)
 	if !ok {
 		return fmt.Errorf("escldrv: unexpected settings %T", s)
 	}
-	docs, err := d.c.Scan(ctx, st)
+	docs, err := d.c.Scan(ctx, st.ScanSettings)
 	if errors.Is(err, escl.ErrBusy) {
 		return fmt.Errorf("%w: %w", scanner.ErrBusy, err)
 	}
@@ -246,7 +254,7 @@ func (d *Device) Scan(ctx context.Context, s scanner.Settings, onPage func(scann
 		return err
 	}
 	for _, doc := range docs {
-		if err := onPage(scanner.Page{Data: doc.Data}); err != nil {
+		if err := onPage(scanner.Page{Data: doc.Data, AutoCrop: st.AutoCrop}); err != nil {
 			return err
 		}
 	}

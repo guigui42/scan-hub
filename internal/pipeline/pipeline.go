@@ -19,7 +19,7 @@ var ErrEmpty = errors.New("session has no pages")
 func PDFPages(store *session.Store, m session.Manifest) []pdf.Page {
 	pages := make([]pdf.Page, 0, len(m.Pages))
 	for _, p := range m.Pages {
-		pages = append(pages, pdf.Page{Path: store.PagePath(m.ID, p), MIME: p.MIME, DPI: p.DPI})
+		pages = append(pages, pdf.Page{Path: store.PagePath(m.ID, p), MIME: p.MIME, DPI: p.DPI, Crop: p.Crop})
 	}
 	return pages
 }

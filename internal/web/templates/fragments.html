@@ -73,11 +73,14 @@
 <ol class="sheets">
   {{range $i, $p := .M.Pages}}
   <li class="sheet">
-    <button type="button" class="sheet-img" @click="openLightbox" data-full="/sessions/{{$.M.ID}}/pages/{{$p.File}}/image" aria-label="View page {{inc $i}}">
-      {{if $p.Thumb}}<img src="/sessions/{{$.M.ID}}/pages/{{$p.File}}/thumb" alt="" loading="lazy" width="360" height="{{thumbH $p.Width $p.Height}}">{{else}}<span class="sheet-noimg">No preview</span>{{end}}
+    <button type="button" class="sheet-img" @click="openLightbox" data-full="/sessions/{{$.M.ID}}/pages/{{$p.File}}/image?v={{$p.Rev}}" aria-label="View page {{inc $i}}">
+      {{if $p.Thumb}}<img src="/sessions/{{$.M.ID}}/pages/{{$p.File}}/thumb?v={{$p.Rev}}" alt="" loading="lazy" width="360" height="{{thumbH $p.OutW $p.OutH}}">{{else}}<span class="sheet-noimg">No preview</span>{{end}}
     </button>
     <span class="sheet-no">{{inc $i}}</span>
-    <span class="sheet-meta">{{scannerLabel $p.Scanner}}{{if $p.DPI}} · {{$p.DPI}} dpi{{end}}</span>
+    <span class="sheet-foot">
+      <span class="sheet-meta">{{scannerLabel $p.Scanner}}{{if $p.DPI}} · {{$p.DPI}} dpi{{end}}{{if $p.Crop}} · <span class="sheet-cropped">cropped</span>{{end}}</span>
+      {{if and $p.Width $p.Height}}<button type="button" class="sheet-crop" @click="openCrop" data-file="{{$p.File}}" data-src="/sessions/{{$.M.ID}}/pages/{{$p.File}}/image?full=1" data-w="{{$p.Width}}" data-h="{{$p.Height}}"{{with $p.Crop}} data-crop="{{.X}},{{.Y}},{{.W}},{{.H}}"{{end}} aria-label="Crop page {{inc $i}}">Crop</button>{{end}}
+    </span>
     <span class="sheet-del-wrap" x-data="confirm">
       <button type="button" class="sheet-del" x-show="idle" @click="arm" aria-label="Remove page {{inc $i}}">✕</button>
       <button type="button" class="sheet-del sheet-del-armed" x-show="armed" x-cloak hx-delete="/sessions/{{$.M.ID}}/pages/{{$p.File}}" hx-target="#pages" aria-label="Confirm: remove page {{inc $i}}">Remove?</button>

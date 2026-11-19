@@ -407,6 +407,44 @@ button { font: inherit; color: inherit; }
 .stamp-btn-label { font: italic 400 1.75rem/1 var(--serif); }
 .stamp-btn-sub { font: 500 11px var(--mono); text-transform: uppercase; letter-spacing: .14em; opacity: .85; }
 
+.sheet-foot { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.sheet-cropped { color: var(--ink-2); }
+.sheet-crop {
+  appearance: none; border: 0; background: none; padding: 2px 0; cursor: pointer;
+  font: 600 11px var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--ink-2);
+  text-decoration: underline; text-underline-offset: 3px;
+}
+.sheet-crop:hover { color: var(--ink); }
+
+/* crop editor */
+.cropper {
+  position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 16px;
+  background: rgba(20, 18, 14, .88); animation: fade-in .2s both;
+}
+.cropper-panel { display: grid; gap: 14px; justify-items: center; max-width: 100%; max-height: 100%; }
+.cropper-hint { margin: 0; color: var(--paper-hi); font-size: 12px; opacity: .8; text-align: center; }
+.cropper-stage {
+  position: relative; touch-action: none; user-select: none; cursor: crosshair;
+  box-shadow: 0 30px 60px -20px #000;
+}
+.cropper-stage img { display: block; max-width: min(calc(100vw - 32px), 900px); max-height: calc(100vh - 170px); background: #fff; pointer-events: none; }
+/* The shade clips the dimming to the page; the frame and its handles sit
+   on top, unclipped. */
+.cropper-shade { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+.cropper-hole { position: absolute; box-shadow: 0 0 0 100vmax rgba(20, 18, 14, .55); }
+.cropper-box { position: absolute; cursor: move; outline: 2px solid var(--paper-hi); }
+.cropper-h {
+  position: absolute; width: 22px; height: 22px; border-radius: 50%;
+  background: var(--paper-hi); border: 2px solid var(--ink); box-shadow: var(--shadow);
+}
+.cropper-h[data-mode="nw"] { left: -11px; top: -11px; cursor: nwse-resize; }
+.cropper-h[data-mode="ne"] { right: -11px; top: -11px; cursor: nesw-resize; }
+.cropper-h[data-mode="sw"] { left: -11px; bottom: -11px; cursor: nesw-resize; }
+.cropper-h[data-mode="se"] { right: -11px; bottom: -11px; cursor: nwse-resize; }
+.cropper-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
+.cropper-actions .link-btn { background: var(--paper-hi); }
+.cropper-actions .link-btn.primary { background: var(--ink); color: var(--paper-hi); border-color: var(--ink); }
+
 /* lightbox */
 .lightbox {
   position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 20px;
